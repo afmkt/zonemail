@@ -1,4 +1,5 @@
 use crate::app::AppState;
+use crate::db::InboundMessage;
 use mail_parser::MessageParser;
 use smtpd::{Error as SmtpError, Response, Session, SmtpConfig, async_trait, start_server};
 use std::borrow::Cow;
@@ -59,8 +60,18 @@ impl smtpd::SmtpHandler for ZonedMailHandler {
                 subject,
                 body.len()
             );
-
-            // TODO: Save parsed email content or raw bytes to database/storage for the user
+            let mut db = self.state.db.clone();
+            toasty::create!(InboundMessage {
+                recipient_id: recipient,
+                subject: subject.to_string(),
+                body: body.to_string(),
+            })
+            .exec(&mut db)
+            .await
+            .map_err(|e| {
+                warn!("Failed to save inbound message: {}", e);
+                SmtpError::Abort
+            })?;
         } else {
             warn!("Failed to parse raw email payload");
         }
