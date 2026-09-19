@@ -1,0 +1,28 @@
+[package]
+name = "zonemail"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "*", features = ["full"] }
+salvo = { version = "*", features = ["full"] }
+toasty = { version = "*", features = ["turso", "postgresql", "jiff"] }
+jiff = { version = "0.2", features = ["serde"] }
+toasty-driver-turso = "*"
+toasty-cli = "*"
+turso = "*"
+tracing = { version = "*" }
+tracing-subscriber = { version = "*" }
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+rust-embed = "*"
+
+# Mail & DNS Crates
+lettre = "*"
+samotop = "*"          # Inbound SMTP server framework
+mail-parser = "*"      # MIME parser for incoming mail
+hickory-server = "*"   # Authoritative DNS server
+hickory-resolver = "*" # DNS resolver for outbound MX lookups
+
+# Utilities
+thiserror = "*"
