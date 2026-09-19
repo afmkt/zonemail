@@ -1,23 +1,23 @@
 use crate::config::Config;
 use crate::db::{Domain, Mailbox, Record};
-use std::path::Path;
-use tokio::fs::*;
+// use std::path::Path;
+// use tokio::fs::*;
 use tracing::info;
 
-async fn ensure_dir(dir: &Path) -> Result<(), std::io::Error> {
-    let exists = try_exists(dir).await?;
-    if !exists {
-        create_dir_all(dir).await?;
-    }
-    if metadata(dir).await?.is_dir() {
-        Ok(())
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} is not a directory", dir.display()),
-        ))
-    }
-}
+// async fn ensure_dir(dir: &Path) -> Result<(), std::io::Error> {
+//     let exists = try_exists(dir).await?;
+//     if !exists {
+//         create_dir_all(dir).await?;
+//     }
+//     if metadata(dir).await?.is_dir() {
+//         Ok(())
+//     } else {
+//         Err(std::io::Error::new(
+//             std::io::ErrorKind::InvalidInput,
+//             format!("{} is not a directory", dir.display()),
+//         ))
+//     }
+// }
 
 #[derive(Clone)]
 pub struct AppState {

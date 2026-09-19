@@ -20,11 +20,10 @@ rust-embed = "*"
 
 # Mail & DNS Crates
 lettre = "*"
-samotop = "*"          # Inbound SMTP server framework
+smtpd = "*"            # SMTP server for incoming mail
 mail-parser = "*"      # MIME parser for incoming mail
 hickory-server = "*"   # Authoritative DNS server
 hickory-resolver = "*" # DNS resolver for outbound MX lookups
-
+hickory-proto = "*"
 # Utilities
 thiserror = "*"
-hickory-proto = "0.26.3"
