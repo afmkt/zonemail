@@ -27,3 +27,4 @@ hickory-resolver = "*" # DNS resolver for outbound MX lookups
 
 # Utilities
 thiserror = "*"
+hickory-proto = "0.26.3"

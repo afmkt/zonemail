@@ -8489,6 +8489,7 @@ name = "zonemail"
 version = "0.1.0"
 dependencies = [
  "config",
+ "hickory-proto 0.26.3",
  "hickory-resolver",
  "hickory-server",
  "jiff",

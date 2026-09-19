@@ -1,8 +1,11 @@
 use salvo::prelude::*;
+use std::sync::Arc;
 use tracing::{error, info};
 use zonemail::api::create_router;
 use zonemail::app::AppState;
 use zonemail::config::Config;
+use zonemail::dns::run_dns_server;
+use zonemail::email::run_mail_server;
 // Define a proper Salvo handler function
 #[handler]
 async fn hello(res: &mut Response) {
@@ -23,12 +26,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Optional: Run database connection and seed initial data
 
     let app_state = AppState::init(&cfg).await?;
+    let shared_state = Arc::new(app_state.clone());
 
     info!("Database initialized and seeded successfully.");
 
     // 4. Set up Salvo Web & API Router
     let router = create_router();
-    let router = router.hoop(salvo::affix_state::inject(app_state.clone()));
+    let router = router.hoop(salvo::affix_state::inject(shared_state.clone()));
 
     // 5. Build Server Address Bindings from Config
     let api_addr = cfg.api_addr()?;
@@ -42,14 +46,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Server::new(acceptor).serve(router).await;
     };
 
-    let dns_server = async move {
-        info!("Hickory DNS server initializing on {}", dns_addr);
-        std::future::pending::<()>().await;
+    let dns_server = {
+        async move {
+            if let Err(e) = run_dns_server(dns_addr, shared_state.clone()).await {
+                error!("DNS server failed: {}", e);
+            }
+        }
     };
 
-    let mail_inbound = async move {
-        info!("Samotop SMTP inbound server initializing on {}", smtp_addr);
-        std::future::pending::<()>().await;
+    let mail_inbound = {
+        async move {
+            if let Err(e) = run_mail_server(smtp_addr, shared_state.clone()).await {
+                error!("SMTP server failed: {}", e);
+            }
+        }
     };
 
     // 7. Run everything together under Tokio Select
