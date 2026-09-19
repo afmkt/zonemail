@@ -1,8 +1,8 @@
 use crate::config::Config;
-use crate::db::{Domain, Mailbox, Record, RecordDTO, RecordType};
-use std::path::{Path, PathBuf};
+use crate::db::{Domain, Mailbox, Record};
+use std::path::Path;
 use tokio::fs::*;
-use tracing::{error, info};
+use tracing::info;
 
 async fn ensure_dir(dir: &Path) -> Result<(), std::io::Error> {
     let exists = try_exists(dir).await?;

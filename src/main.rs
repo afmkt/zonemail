@@ -47,16 +47,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let dns_server = {
+        let shared_state = shared_state.clone();
         async move {
-            if let Err(e) = run_dns_server(dns_addr, shared_state.clone()).await {
+            if let Err(e) = run_dns_server(dns_addr, shared_state).await {
                 error!("DNS server failed: {}", e);
             }
         }
     };
 
     let mail_inbound = {
+        let shared_state = shared_state.clone();
         async move {
-            if let Err(e) = run_mail_server(smtp_addr, shared_state.clone()).await {
+            if let Err(e) = run_mail_server(smtp_addr, shared_state).await {
                 error!("SMTP server failed: {}", e);
             }
         }
