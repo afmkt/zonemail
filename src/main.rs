@@ -1,7 +1,8 @@
 use salvo::prelude::*;
-use zonemail::db::{Domain, InboundMessage, Mailbox, OutboundMessage};
-
 use tracing::{error, info};
+use zonemail::api::create_router;
+use zonemail::app::AppState;
+use zonemail::config::Config;
 // Define a proper Salvo handler function
 #[handler]
 async fn hello(res: &mut Response) {
@@ -14,30 +15,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     info!("Starting Zonemail daemon...");
 
-    // 2. Set up Salvo Web & API Router
-    let router = Router::new().get(hello);
+    // 2. Load configuration (defaults + Settings.toml + Env overrides)
+    let cfg = Config::load()?;
+    info!("Configuration loaded successfully.");
+    info!("Database URL: {}", cfg.database_url);
 
-    // 3. Spawn Subsystems concurrently
-    let api_server = async {
-        let addr = "127.0.0.1:8080";
-        info!("Salvo API listening on http://{}", addr);
-        // Salvo v0.96 listener pattern: TcpListener::new(addr).bind().await
-        let acceptor = TcpListener::new(addr).bind().await;
+    // 3. Optional: Run database connection and seed initial data
+
+    let app_state = AppState::init(&cfg).await?;
+
+    info!("Database initialized and seeded successfully.");
+
+    // 4. Set up Salvo Web & API Router
+    let router = create_router();
+    let router = router.hoop(salvo::affix_state::inject(app_state.clone()));
+
+    // 5. Build Server Address Bindings from Config
+    let api_addr = cfg.api_addr()?;
+    let dns_addr = cfg.dns_addr()?;
+    let smtp_addr = cfg.smtp_addr()?;
+
+    // 6. Define Subsystems concurrently
+    let api_server = async move {
+        info!("Salvo API listening on http://{}", api_addr);
+        let acceptor = TcpListener::new(api_addr).bind().await;
         Server::new(acceptor).serve(router).await;
     };
 
-    let dns_server = async {
-        info!("Hickory DNS server initializing on port 53...");
-        // Use std::future::pending() instead of tokio::pending!()
+    let dns_server = async move {
+        info!("Hickory DNS server initializing on {}", dns_addr);
         std::future::pending::<()>().await;
     };
 
-    let mail_inbound = async {
-        info!("Samotop SMTP inbound server initializing on port 25...");
+    let mail_inbound = async move {
+        info!("Samotop SMTP inbound server initializing on {}", smtp_addr);
         std::future::pending::<()>().await;
     };
 
-    // Run everything together
+    // 7. Run everything together under Tokio Select
     tokio::select! {
         _ = api_server => error!("Salvo API server stopped unexpectedly"),
         _ = dns_server => error!("DNS server stopped unexpectedly"),
