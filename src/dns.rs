@@ -1,6 +1,6 @@
 use crate::app::AppState;
-use crate::db::{Domain, Record, RecordType};
-use hickory_proto::op::{Message, ResponseCode};
+use crate::db::{Record, RecordType};
+use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType as HickoryRecordType};
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
@@ -52,15 +52,18 @@ async fn handle_dns_query(
         }
     };
 
-    // Create response using Message::response helper
-    let mut response = Message::response(request.id, request.op_code);
-    response.metadata.recursion_desired = request.recursion_desired;
-    response.metadata.recursion_available = false;
-    response.metadata.authoritative = true;
+    // Create response using the builder-style API available in hickory-proto 0.24
+    let mut response = Message::new();
+    response.set_message_type(MessageType::Response);
+    response.set_id(request.id());
+    response.set_op_code(request.header().op_code());
+    response.set_recursion_desired(request.header().recursion_desired());
+    response.set_recursion_available(false);
+    response.set_authoritative(true);
 
     let mut db = app_state.db.clone();
 
-    for query in &request.queries {
+    for query in request.queries() {
         let name = query.name().to_string();
         let clean_name = name.trim_end_matches('.').to_string();
         let qtype = query.query_type();
@@ -72,9 +75,9 @@ async fn handle_dns_query(
         let records = query_records(&mut db, &clean_name, qtype).await;
 
         if records.is_empty() {
-            response.metadata.response_code = ResponseCode::NXDomain;
+            response.set_response_code(ResponseCode::NXDomain);
         } else {
-            response.metadata.response_code = ResponseCode::NoError;
+            response.set_response_code(ResponseCode::NoError);
             for rec in records {
                 if let Some(rdata) = parse_rdata(qtype, &rec.value) {
                     let dns_record =

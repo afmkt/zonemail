@@ -4,26 +4,80 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+salvo = { version = "*", features = [
+    "cookie",
+    "fix-http1-request-uri",
+    "server",
+    "server-handle",
+    "http1",
+    "http2",
+    "http2-cleartext",
+    "quinn",
+    "rustls",
+    "native-tls",
+    "openssl",
+    "unix",
+    "socket2",
+    "tower-compat",
+    "anyhow",
+    "test",
+    "affix-state",
+    "basic-auth",
+    "craft",
+    "force-https",
+    "jwt-auth",
+    "catch-panic",
+    "compression",
+    "logging",
+    "proxy",
+    "concurrency-limiter",
+    "rate-limiter",
+    "sse",
+    "trailing-slash",
+    "timeout",
+    "websocket",
+    "request-id",
+    "caching-headers",
+    "cache",
+    "cors",
+    "csrf",
+    "flash",
+    "session",
+    "serve-static",
+    "otel",
+    "oapi",
+    "rfc9457",
+    "aws-lc-rs",
+    "matched-path",
+    "tus",
+] }
 config = "*"
 tokio = { version = "*", features = ["full"] }
-salvo = { version = "*", features = ["full"] }
+# "full" minus "acme": the acme feature pulls in certon -> hickory-* 0.26.3,
+# which does not compile on current toolchains. This project uses hickory 0.24 directly.
 toasty = { version = "*", features = ["turso", "postgresql", "jiff"] }
-jiff = { version = "0.2", features = ["serde"] }
+jiff = { version = "*", features = ["serde"] }
 toasty-driver-turso = "*"
 toasty-cli = "*"
 turso = "*"
-tracing = { version = "*" }
-tracing-subscriber = { version = "*" }
+tracing = "*"
+tracing-subscriber = "*"
 serde = { version = "*", features = ["derive"] }
 serde_json = "*"
 rust-embed = "*"
 
 # Mail & DNS Crates
-lettre = "*"
-smtpd = "*"            # SMTP server for incoming mail
-mail-parser = "*"      # MIME parser for incoming mail
-hickory-server = "*"   # Authoritative DNS server
-hickory-resolver = "*" # DNS resolver for outbound MX lookups
-hickory-proto = "*"
+lettre = { version = "*", features = [
+    "builder",
+    "smtp-transport",
+    "tokio1",
+    "tokio1-native-tls",
+] }
+smtpd = "*"
+mail-parser = "*"
+hickory-server = "0.24"
+hickory-resolver = "0.24"
+hickory-proto = "0.24"
+
 # Utilities
 thiserror = "*"

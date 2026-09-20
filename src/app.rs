@@ -84,7 +84,7 @@ impl AppState {
             // Insert DNS records
             toasty::create!(Record {
                 domain_id: record.domain_id,
-                name: record.name,
+
                 record_type: record.record_type,
                 value: record.value,
                 ttl: record.ttl,
@@ -92,8 +92,8 @@ impl AppState {
             .exec(&mut self.db)
             .await?;
             info!(
-                "Seeded DNS record [{:?}] {} -> {}",
-                record_dto.record_type, record_dto.name, record_dto.value
+                "Seeded DNS record [{:?}] -> {}",
+                record_dto.record_type, record_dto.value
             );
         }
 

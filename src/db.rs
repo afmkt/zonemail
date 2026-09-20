@@ -109,9 +109,7 @@ impl From<HickoryRecordType> for RecordType {
             HickoryRecordType::CAA => RecordType::CAA,
             HickoryRecordType::CDS => RecordType::CDS,
             HickoryRecordType::CDNSKEY => RecordType::CDNSKEY,
-            HickoryRecordType::CERT => RecordType::CERT,
             HickoryRecordType::CNAME => RecordType::CNAME,
-            HickoryRecordType::DNAME => RecordType::DNAME,
             HickoryRecordType::CSYNC => RecordType::CSYNC,
             HickoryRecordType::DNSKEY => RecordType::DNSKEY,
             HickoryRecordType::DS => RecordType::DS,
@@ -131,7 +129,6 @@ impl From<HickoryRecordType> for RecordType {
             HickoryRecordType::PTR => RecordType::PTR,
             HickoryRecordType::RRSIG => RecordType::RRSIG,
             HickoryRecordType::SIG => RecordType::SIG,
-            HickoryRecordType::SMIMEA => RecordType::SMIMEA,
             HickoryRecordType::SOA => RecordType::SOA,
             HickoryRecordType::SRV => RecordType::SRV,
             HickoryRecordType::SSHFP => RecordType::SSHFP,
@@ -166,8 +163,8 @@ impl From<RecordType> for HickoryRecordType {
             RecordType::AXFR => HickoryRecordType::AXFR,
             RecordType::CDS => HickoryRecordType::CDS,
             RecordType::CDNSKEY => HickoryRecordType::CDNSKEY,
-            RecordType::CERT => HickoryRecordType::CERT,
-            RecordType::DNAME => HickoryRecordType::DNAME,
+            RecordType::CERT => HickoryRecordType::Unknown(0x000A), // CERT
+            RecordType::DNAME => HickoryRecordType::Unknown(0x0027), // DNAME
             RecordType::CSYNC => HickoryRecordType::CSYNC,
             RecordType::DNSKEY => HickoryRecordType::DNSKEY,
             RecordType::DS => HickoryRecordType::DS,
@@ -183,7 +180,7 @@ impl From<RecordType> for HickoryRecordType {
             RecordType::OPT => HickoryRecordType::OPT,
             RecordType::RRSIG => HickoryRecordType::RRSIG,
             RecordType::SIG => HickoryRecordType::SIG,
-            RecordType::SMIMEA => HickoryRecordType::SMIMEA,
+            RecordType::SMIMEA => HickoryRecordType::Unknown(0x0041), // SMIMEA
             RecordType::SSHFP => HickoryRecordType::SSHFP,
             RecordType::TLSA => HickoryRecordType::TLSA,
             RecordType::TSIG => HickoryRecordType::TSIG,
