@@ -1,1 +1,6 @@
 /target
+*.db
+*.db-log
+*.tmp
+*.db-wal
+*.swp
