@@ -244,7 +244,7 @@ impl From<&Domain> for String {
 }
 
 #[derive(Model)]
-#[unique(domain_id, name, record_type, value)]
+#[unique(domain_id, record_type, value)]
 pub struct Record {
     #[key]
     #[auto]
@@ -252,7 +252,6 @@ pub struct Record {
 
     #[index]
     pub domain_id: String,
-    pub name: String,
     pub record_type: RecordType,
     pub value: String,
     pub ttl: u32,
@@ -269,7 +268,7 @@ pub struct Record {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordDTO {
     pub domain_id: String,
-    pub name: String,
+
     pub record_type: RecordType,
     pub value: String,
     pub ttl: u32,
@@ -280,7 +279,7 @@ impl From<RecordDTO> for Record {
         Record {
             id: 0, // This will be auto-generated
             domain_id: dto.domain_id,
-            name: dto.name,
+
             record_type: dto.record_type,
             value: dto.value,
             ttl: dto.ttl,
@@ -299,7 +298,7 @@ impl From<Record> for RecordDTO {
     fn from(record: Record) -> Self {
         RecordDTO {
             domain_id: record.domain_id,
-            name: record.name,
+
             record_type: record.record_type,
             value: record.value,
             ttl: record.ttl,

@@ -90,50 +90,17 @@ async fn handle_dns_query(
     Ok(())
 }
 
-// Given a query like "mail.sub.zonemail.net" and your known domains from the DB
-fn parse_domain_and_name(query_name: &str, known_domains: &[String]) -> Option<(String, String)> {
-    let labels: Vec<&str> = query_name.split('.').collect();
-
-    // Try matching from the full string down to smaller suffixes
-    for i in 0..labels.len() {
-        let candidate_domain = labels[i..].join(".");
-        if known_domains.contains(&candidate_domain) {
-            let record_name = if i == 0 {
-                "@".to_string() // or "" depending on how you store root records
-            } else {
-                labels[..i].join(".")
-            };
-            return Some((candidate_domain, record_name));
-        }
-    }
-    None // Domain not hosted by this server
-}
-
 async fn query_records(db: &mut toasty::Db, name: &str, qtype: HickoryRecordType) -> Vec<Record> {
-    let all_domain = Domain::all().exec(db).await.unwrap_or_else(|_| vec![]);
-    if let Some((domain_id, record_name)) = parse_domain_and_name(
-        name,
-        &all_domain.iter().map(|d| d.id.clone()).collect::<Vec<_>>(),
-    ) {
-        info!(
-            "Matched domain: {}, record name: {}",
-            domain_id, record_name
-        );
-        let all_records = Record::filter(
-            Record::fields()
-                .name()
-                .eq(record_name)
-                .and(Record::fields().record_type().eq(RecordType::from(qtype)))
-                .and(Record::fields().domain_id().eq(domain_id)),
-        )
-        .exec(db)
-        .await
-        .unwrap_or_else(|_| vec![]);
-        all_records.into_iter().collect()
-    } else {
-        info!("No matching domain found for query: {}", name);
-        vec![]
-    }
+    let all_records = Record::filter(
+        Record::fields()
+            .domain_id()
+            .eq(name)
+            .and(Record::fields().record_type().eq(RecordType::from(qtype))),
+    )
+    .exec(db)
+    .await
+    .unwrap_or_else(|_| vec![]);
+    all_records.into_iter().collect()
 }
 
 fn parse_rdata(qtype: HickoryRecordType, value: &str) -> Option<RData> {
