@@ -64,7 +64,11 @@ impl AppState {
 
         // Seed Mailboxes
         for mailbox_str in &config.mailboxes {
-            if let Ok(mailbox) = Mailbox::try_from(mailbox_str.as_str()) {
+            if let Ok(mut mailbox) = Mailbox::try_from(mailbox_str.as_str()) {
+                 // Normalize to lowercase so the open-relay check in `handle_rcpt`
+                 // (which lowercases the incoming address) matches provisioned mailboxes
+                 // regardless of the case used in config.
+                mailbox.id = mailbox.id.to_lowercase();
                 let exists = Mailbox::get_by_id(&mut self.db, &mailbox.id).await.is_ok();
                 if !exists {
                     toasty::create!(Mailbox {

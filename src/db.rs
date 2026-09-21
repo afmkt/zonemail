@@ -325,9 +325,9 @@ pub struct Mailbox {
     pub domain: Deferred<Domain>,
 
     #[has_many]
-    pub outbound: Deferred<Vec<OutboundMessage>>,
+    pub outbound: Deferred<Vec<Outbound>>,
     #[has_many]
-    pub inbound: Deferred<Vec<InboundMessage>>,
+    pub inbound: Deferred<Vec<Inbound>>,
 }
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MailboxError {
@@ -387,42 +387,63 @@ impl From<&Mailbox> for String {
 }
 
 #[derive(Model)]
-pub struct InboundMessage {
+pub struct Message {
     #[key]
     #[auto]
     pub id: u64,
-    pub envelope_from: String,
+    pub mail_from: String,
+    pub raw: Vec<u8>,
+    pub subject: Option<String>,
+
+    pub message_id_header: Option<String>,
+    pub content_type: Option<String>,
+    pub from_address: Option<String>,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    #[auto]
+    pub created_at: jiff::Timestamp,
+    #[auto]
+    pub updated_at: jiff::Timestamp,
+}
+
+#[derive(Model)]
+pub struct Inbound {
+    #[key]
+    #[auto]
+    pub id: u64,
 
     #[index]
-    pub recipient_id: String,
+    pub message_id: u64,
 
-    pub subject: Option<String>,
-    pub body: Option<String>,
+    #[index]
+    pub rcpt_to: String,
 
     #[auto]
     pub created_at: jiff::Timestamp,
     #[auto]
     pub updated_at: jiff::Timestamp,
 
-    #[belongs_to(key = recipient_id, references = id)]
+    #[belongs_to(key = rcpt_to, references = id)]
     pub mailbox: Deferred<Mailbox>,
 
-    #[has_many]
-    pub delivery_statuses: Deferred<Vec<DeliveryStatus>>,
+    #[belongs_to(key = message_id, references = id)]
+    pub message: Deferred<Message>,
 }
 
 #[derive(Model)]
-pub struct OutboundMessage {
+pub struct Outbound {
     #[key]
     #[auto]
     pub id: u64,
 
     #[index]
-    pub sender_id: String,
+    pub message_id: u64,
 
-    pub envelope_to: String,
-    pub subject: Option<String>,
-    pub body: Option<String>,
+    pub rcpt_to: String,
+
+    #[index]
+    pub sender_id: String,
 
     #[auto]
     pub created_at: jiff::Timestamp,
@@ -431,6 +452,9 @@ pub struct OutboundMessage {
 
     #[belongs_to(key = sender_id, references = id)]
     pub mailbox: Deferred<Mailbox>,
+
+    #[belongs_to(key = message_id, references = id)]
+    pub message: Deferred<Message>,
 
     #[has_many]
     pub delivery_statuses: Deferred<Vec<DeliveryStatus>>,
@@ -443,9 +467,7 @@ pub struct DeliveryStatus {
     pub id: u64,
 
     #[index]
-    pub outbound_message_id: Option<u64>,
-    #[index]
-    pub inbound_message_id: Option<u64>,
+    pub outbound_id: u64,
 
     pub peer_host: String,
     pub code: Option<u64>,
@@ -456,8 +478,6 @@ pub struct DeliveryStatus {
     #[auto]
     pub updated_at: jiff::Timestamp,
 
-    #[belongs_to]
-    pub outbound_message: Deferred<OutboundMessage>,
-    #[belongs_to]
-    pub inbound_message: Deferred<InboundMessage>,
+    #[belongs_to(key = outbound_id, references = id )]
+    pub outbound: Deferred<Outbound>,
 }
