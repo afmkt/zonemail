@@ -56,6 +56,9 @@ tokio = { version = "*", features = ["full"] }
 # "full" minus "acme": the acme feature pulls in certon -> hickory-* 0.26.3,
 # which does not compile on current toolchains. This project uses hickory 0.24 directly.
 toasty = { version = "*", features = ["turso", "postgresql", "jiff"] }
+    # Direct dep so we can name `TransactionMode` (not re-exported by `toasty`)
+    # for the atomic, write-locked claim used by the outbound worker.
+    toasty-core = "0.10"
 jiff = { version = "*", features = ["serde"] }
 toasty-driver-turso = "*"
 toasty-cli = "*"

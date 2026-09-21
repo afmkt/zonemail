@@ -304,7 +304,12 @@ impl From<Record> for RecordDTO {
 }
 impl From<&Record> for RecordDTO {
     fn from(value: &Record) -> Self {
-        value.into()
+        RecordDTO {
+            domain_id: value.domain_id.clone(),
+            record_type: value.record_type,
+            value: value.value.clone(),
+            ttl: value.ttl,
+        }
     }
 }
 
@@ -451,7 +456,6 @@ pub enum OutboundStatus {
 
 #[derive(Model)]
 pub struct Outbound {
-
     #[key]
     #[auto]
     pub id: u64,
@@ -464,17 +468,16 @@ pub struct Outbound {
     #[index]
     pub sender_id: String,
 
-     // Queue lifecycle status; indexed so the worker can fetch due work cheaply.
-#[index]
+    // Queue lifecycle status; indexed so the worker can fetch due work cheaply.
+    #[index]
     pub status: OutboundStatus,
-     // Number of delivery attempts recorded so far.
+    // Number of delivery attempts recorded so far.
     pub attempts: u64,
-     // When the next attempt is permitted; `None` means "as soon as possible".
-#[index]
+    // When the next attempt is permitted; `None` means "as soon as possible".
+    #[index]
     pub next_attempt_at: Option<jiff::Timestamp>,
-     // Human-readable reason for the most recent failure, if any.
+    // Human-readable reason for the most recent failure, if any.
     pub last_error: Option<String>,
-
 
     #[auto]
     pub created_at: jiff::Timestamp,

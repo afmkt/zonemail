@@ -7880,6 +7880,7 @@ dependencies = [
  "thiserror 2.0.20",
  "toasty",
  "toasty-cli",
+ "toasty-core",
  "toasty-driver-turso",
  "tokio",
  "tracing",
