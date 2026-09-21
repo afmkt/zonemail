@@ -431,8 +431,27 @@ pub struct Inbound {
     pub message: Deferred<Message>,
 }
 
+// Lifecycle of an outbound delivery job (a `Outbound` row doubles as the queue
+// entry and its audit trail). `Queued` rows are the work items the background
+// worker picks up; `InProgress` is the in-flight claim; `Delivered`/`Failed` are
+// terminal. After a transient failure a job returns to `Queued` with a backoff
+// in `next_attempt_at` until `attempts` reaches `max_attempts`, at which point it
+// settles to `Failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, toasty::Embed)]
+pub enum OutboundStatus {
+    /// Awaiting its next delivery attempt.
+    Queued,
+    /// Currently being attempted by the worker.
+    InProgress,
+    /// Delivered successfully to the peer MX (terminal).
+    Delivered,
+    /// Exceeded the retry cap without a successful delivery (terminal).
+    Failed,
+}
+
 #[derive(Model)]
 pub struct Outbound {
+
     #[key]
     #[auto]
     pub id: u64,
@@ -444,6 +463,18 @@ pub struct Outbound {
 
     #[index]
     pub sender_id: String,
+
+     // Queue lifecycle status; indexed so the worker can fetch due work cheaply.
+#[index]
+    pub status: OutboundStatus,
+     // Number of delivery attempts recorded so far.
+    pub attempts: u64,
+     // When the next attempt is permitted; `None` means "as soon as possible".
+#[index]
+    pub next_attempt_at: Option<jiff::Timestamp>,
+     // Human-readable reason for the most recent failure, if any.
+    pub last_error: Option<String>,
+
 
     #[auto]
     pub created_at: jiff::Timestamp,

@@ -6,6 +6,7 @@ use zonemail::app::AppState;
 use zonemail::config::Config;
 use zonemail::dns::run_dns_server;
 use zonemail::email::run_mail_server;
+use zonemail::send::{run_outbound_worker, OutboundWorkerConfig};
 // Define a proper Salvo handler function
 #[handler]
 async fn hello(res: &mut Response) {
@@ -64,11 +65,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+      // The outbound delivery worker is a fire-and-forget poll loop that runs
+      // until the surrounding `select!` is cancelled; it drains the in-database
+      // queue on a timer and never returns under normal operation.
+    let outbound_worker = {
+        let db = shared_state.db.clone();
+        async move {
+            run_outbound_worker(db, OutboundWorkerConfig::default()).await;
+           }
+     };
+
     // 7. Run everything together under Tokio Select
     tokio::select! {
         _ = api_server => error!("Salvo API server stopped unexpectedly"),
         _ = dns_server => error!("DNS server stopped unexpectedly"),
         _ = mail_inbound => error!("Inbound Mail server stopped unexpectedly"),
+        _ = outbound_worker => error!("Outbound delivery worker stopped unexpectedly"),
         _ = tokio::signal::ctrl_c() => {
             info!("Received shutdown signal, shutting down gracefully.");
         }
