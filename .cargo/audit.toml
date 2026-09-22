@@ -1,0 +1,25 @@
+# cargo-audit configuration
+#
+# These advisories are explicitly ignored because no fix is available on our
+# current toolchain. Each entry should be revisited when the underlying issue
+# is resolved upstream.
+
+[advisories]
+ignore = [
+    # hickory-proto 0.24.4 – O(n²) name compression.
+    # Fix requires >= 0.26.1, but hickory-proto 0.26.3 does not compile on
+    # rustc 1.95.0 (RecordType is missing Clone/Copy/Eq/Hash/Debug impls).
+    # Revisit when hickory-proto >= 0.26 compiles.
+    "RUSTSEC-2026-0119",
+
+    # idna 0.4.0 – Punycode label acceptance.
+    # Pulled transitively by smtpd 0.1.0 → trust-dns-resolver → trust-dns-proto.
+    # smtpd is the only published version and has no upstream fix.
+    "RUSTSEC-2024-0421",
+
+    # rsa – Marvin Attack (timing sidechannel), no upstream fix.
+    # Not present in the active dependency tree; pulled into Cargo.lock only
+    # because cargo resolves optional features (salvo/acme → certon → rsa,
+    # toasty-driver-mysql → sqlx-mysql → rsa) that are never enabled.
+    "RUSTSEC-2023-0071",
+]
