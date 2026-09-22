@@ -1,0 +1,254 @@
+# ── Docker image release pipeline (linux/amd64 + linux/arm64). ───────────
+#
+# Publishes a multi-arch manifest to:
+#     * GitHub Container Registry (ghcr.io/<owner>/zonemail)
+#        — public pulls, no extra accounts or secrets: pushes authenticate with
+#        the built-in GITHUB_TOKEN (needs `packages: write`, set below).
+#     * Aliyun ACR (Personal Edition) — reliable pulls from mainland China.
+#        Requires repo secrets ALIYUN_USERNAME / ALIYUN_PASSWORD. Create the
+#        namespace/repo once at https://cr.console.aliyun.com :
+#          Container Registry → Instances (个人版/Personal) →
+#          Namespaces → 创建 → "afmkt"
+#          Images → 创建镜像仓库 → "zonemail"
+#        then set ALIYUN_USERNAME / ALIYUN_PASSWORD in
+#          repo → Settings → Secrets and variables → Actions.
+#
+# Triggered by version tags (v1.2.3); workflow_dispatch pushes
+# `latest` + short-SHA tags without a version tag.
+#
+# NOTE: the first push creates the GHCR package as PRIVATE. Make it public
+# once:  github.com/<owner>/packages/container/zonemail/settings → Public
+#        (or: gh package edit zonemail --owner <owner> --visibility public)
+
+name: Release Docker
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  ALIYUN_REGISTRY: crpi-zuhwpd6fwca3b0fc.cn-shanghai.personal.cr.aliyuncs.com
+  ALIYUN_IMAGE: crpi-zuhwpd6fwca3b0fc.cn-shanghai.personal.cr.aliyuncs.com/afmkt/zonemail
+
+   # ═══════════════ Per-arch builds (push by digest) ═══════════════
+
+jobs:
+
+  docker-amd64:
+    name: Docker image (linux/amd64)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Cross-border link to the mainland registry is flaky from GitHub
+      # runners — retry the login instead of failing the whole release.
+      - name: Login to Aliyun ACR
+        run: |
+          for i in 1 2 3 4 5; do
+            docker login "$ALIYUN_REGISTRY" -u "$ALIYUN_USERNAME" --password-stdin <<< "$ALIYUN_PASSWORD" && exit 0
+            echo "ACR login attempt $i failed; retrying in 30s..."
+            sleep 30
+          done
+          echo "ACR login failed after 5 attempts" >&2
+          exit 1
+        env:
+          ALIYUN_USERNAME: ${{ secrets.ALIYUN_USERNAME }}
+          ALIYUN_PASSWORD: ${{ secrets.ALIYUN_PASSWORD }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          # ACR Personal Edition rejects buildx attestation manifests
+          # (application/vnd.oci.empty.v1+json) — disable provenance/sbom so
+          # a plain digest-pushed image is produced.
+          provenance: false
+          sbom: false
+          # Layer cache lives in GHCR (no 10GB GHA-cache cap, shared across
+          # tags/branches): deps rebuild only when Cargo.toml/lock change.
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-amd64
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-amd64,mode=max
+          outputs: |
+            type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+            type=image,name=${{ env.ALIYUN_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+  docker-arm64:
+    name: Docker image (linux/arm64)
+    # Native arm64 runner: no QEMU, so the Rust build is fast.
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Aliyun ACR
+        run: |
+          for i in 1 2 3 4 5; do
+            docker login "$ALIYUN_REGISTRY" -u "$ALIYUN_USERNAME" --password-stdin <<< "$ALIYUN_PASSWORD" && exit 0
+            echo "ACR login attempt $i failed; retrying in 30s..."
+            sleep 30
+          done
+          echo "ACR login failed after 5 attempts" >&2
+          exit 1
+        env:
+          ALIYUN_USERNAME: ${{ secrets.ALIYUN_USERNAME }}
+          ALIYUN_PASSWORD: ${{ secrets.ALIYUN_PASSWORD }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          provenance: false
+          sbom: false
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-arm64
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache-arm64,mode=max
+          outputs: |
+            type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+            type=image,name=${{ env.ALIYUN_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+   # ═══════════════ Image smoke test ═══════════════
+  #
+  # The per-arch jobs push BY DIGEST — untagged and invisible to users. This
+  # job actually RUNS the amd64 image and probes /health; only then does
+  # docker-publish attach the user-visible tags. A broken image never receives
+  # latest/version tags. DNS(53)/SMTP(25) are privileged, so we override them
+  # to unprivileged ports: a single failing listener would otherwise make the
+  # daemon's `select!` return and exit the process.
+
+  docker-smoke:
+    name: Smoke-test built image
+    needs: [docker-amd64]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image by digest
+        env:
+          DIGEST: ${{ needs.docker-amd64.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker pull "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@$DIGEST"
+
+      - name: Run image and probe /health
+        env:
+          DIGEST: ${{ needs.docker-amd64.outputs.digest }}
+        run: |
+          set -euo pipefail
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@$DIGEST"
+          docker run -d --name zonemail-smoke -p 18081:8081 \
+            -e ZONEMAIL__DNS=5353 \
+            -e ZONEMAIL__SMTP=2525 \
+            "$IMAGE"
+          for _ in $(seq 1 30); do
+            body=$(curl -fsS "http://127.0.0.1:18081/health" || true)
+            if [ -n "$body" ]; then
+              echo "smoke: /health -> $body"
+              docker rm -f zonemail-smoke >/dev/null
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "smoke: /health never responded; logs:" >&2
+          docker logs zonemail-smoke >&2 || true
+          docker rm -f zonemail-smoke >/dev/null || true
+          exit 1
+
+   # ═══════════════ Multi-arch manifest + tags ═══════════════
+
+  docker-publish:
+    name: Publish multi-arch manifest
+    needs: [docker-amd64, docker-arm64, docker-smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Aliyun ACR
+        run: |
+          for i in 1 2 3 4 5; do
+            docker login "$ALIYUN_REGISTRY" -u "$ALIYUN_USERNAME" --password-stdin <<< "$ALIYUN_PASSWORD" && exit 0
+            echo "ACR login attempt $i failed; retrying in 30s..."
+            sleep 30
+          done
+          echo "ACR login failed after 5 attempts" >&2
+          exit 1
+        env:
+          ALIYUN_USERNAME: ${{ secrets.ALIYUN_USERNAME }}
+          ALIYUN_PASSWORD: ${{ secrets.ALIYUN_PASSWORD }}
+
+      - name: Create and push manifests
+        env:
+          AMD64: ${{ needs.docker-amd64.outputs.digest }}
+          ARM64: ${{ needs.docker-arm64.outputs.digest }}
+        run: |
+          set -euo pipefail
+          TAGS=("latest" "${GITHUB_SHA::12}")
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAGS+=("${GITHUB_REF#refs/tags/}")
+          fi
+          # Retry wrapper: the mainland registry link drops requests
+          # intermittently from GitHub runners.
+          retry() {
+            local n
+            for n in 1 2 3 4 5; do
+              "$@" && return 0
+              echo "attempt $n failed: $*; retrying in 30s..."
+              sleep 30
+            done
+            return 1
+          }
+          for repo in "$REGISTRY/$IMAGE_NAME" "$ALIYUN_IMAGE"; do
+            for tag in "${TAGS[@]}"; do
+              retry docker buildx imagetools create \
+                -t "$repo:$tag" \
+                "$repo@$AMD64" \
+                "$repo@$ARM64"
+            done
+            retry docker buildx imagetools inspect "$repo:latest" | head -20
+          done

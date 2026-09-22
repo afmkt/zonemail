@@ -4,3 +4,15 @@
 *.tmp
 *.db-wal
 *.swp
+
+# Application configuration (per-host / per-environment secrets).
+# A sample is vendored as `zonemail.example.toml`.
+/zonemail.toml
+
+# Runtime data (turso libsql files, etc.).
+/data/
+
+# Local tooling / editor noise.
+.DS_Store
+.obsidian/
+.kilo/

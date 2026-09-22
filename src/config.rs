@@ -35,7 +35,7 @@ impl Config {
     pub fn load() -> Result<Self, ConfigError> {
         let builder = ConfigLoader::builder()
             // 1. Optional config file (if it doesn't exist, it's ignored)
-            .add_source(File::with_name("Settings").required(false))
+            .add_source(File::with_name("zonemail").required(false))
             // 2. Environment variable overrides (e.g., ZONEMAIL_SMTP=25)
             .add_source(Environment::with_prefix("ZONEMAIL").separator("__"));
 

@@ -1,0 +1,5 @@
+# Pinned so local builds match CI. Edition 2024 requires Rust >= 1.85.
+# `rustup` reads this automatically when it is present.
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]

@@ -1,0 +1,95 @@
+# Native binary release pipeline.
+#
+# GitHub Release assets (each with a '.sha256' checksum):
+#      * zonemail-linux-amd64.tar.gz    (x64)
+#      * zonemail-linux-arm64.tar.gz    (ARM64)
+#
+# Docker images are published independently by release-docker.yml.
+#
+# macOS / Windows are intentionally NOT built: the binary links the system
+# OpenSSL (salvo 'openssl' + lettre 'tokio1-native-tls'), which complicates
+# cross-compilation. Build the macOS binary locally on Apple Silicon
+# (target/release/zonemail) and attach it to the release manually if needed.
+#
+# Triggered by version tags (v1.2.3); workflow_dispatch builds without
+# creating a GitHub Release. This never runs on push to main, so ordinary
+# commits stay cheap.
+
+name: Release Binaries
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  binaries:
+    name: "Binary (matrix.target)"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            asset: zonemail-linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            asset: zonemail-linux-arm64
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install system dependencies (openssl, pkg-config)
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+      # No runtime smoke here: zonemail `main` has no `--version` flag and
+      # instead starts the API/DNS/SMTP listeners, so it cannot be probed
+      # with a clean one-shot invocation. The Docker release job covers the
+      # run-smoke via /health.
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czf dist/${{ matrix.asset }}.tar.gz \
+            -C target/${{ matrix.target }}/release zonemail
+          (cd dist && sha256sum ${{ matrix.asset }}.tar.gz > ${{ matrix.asset }}.tar.gz.sha256)
+      - uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [binaries]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: zonemail-*
+          path: assets
+          merge-multiple: true
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: assets/*
+          generate_release_notes: true
+          body: |
+            ## Binaries
+            Attached assets for Linux amd64 / arm64, each with a
+            `.sha256` checksum (verify with `sha256sum -c <asset>.sha256`).
+
+            ## Docker images (linux/amd64 + linux/arm64)
+            Published by the "Release Docker" workflow:
+              - `docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}`
+              - Aliyun ACR (mainland China):
+                `crpi-zuhwpd6fwca3b0fc.cn-shanghai.personal.cr.aliyuncs.com/afmkt/zonemail:${{ github.ref_name }}`
+              (also tagged `latest` and short-SHA)

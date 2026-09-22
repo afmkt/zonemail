@@ -1,0 +1,14 @@
+target/
+.git/
+.gitignore
+*.db
+*.db-log
+*.db-wal
+*.tmp
+*.swp
+data/
+docs/
+.kilo/
+.obsidian/
+zonemail.toml
+.env

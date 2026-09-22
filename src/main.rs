@@ -15,7 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     info!("Starting Zonemail daemon...");
 
-    // 2. Load configuration (defaults + Settings.toml + Env overrides)
+    // 2. Load configuration (defaults + zonemail.toml + Env overrides)
     let cfg = Config::load()?;
     info!("Configuration loaded successfully.");
     info!("Database URL: {}", cfg.database_url);

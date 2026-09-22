@@ -1,0 +1,84 @@
+name: Zonemail CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+   # No debug info in CI: a full-debuginfo build of this (openssl + turso +
+   # salvo) tree is large; skip it to stay within the GitHub runner disk cap.
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  build-and-lint:
+    name: Build + Clippy + fmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies (openssl, pkg-config)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+
+      # NOTE: fmt and clippy are non-blocking (continue-on-error) while an
+      # existing format/clippy backlog is worked down. The release build and
+      # cargo audit below are the hard gates. Tighten by dropping
+      # `continue-on-error: true` once `cargo fmt` and `cargo clippy --all
+      # --all-features -D warnings` are both clean.
+      - name: Check formatting (advisory)
+        continue-on-error: true
+        run: cargo fmt -- --check
+
+      - name: Clippy lint check (advisory)
+        continue-on-error: true
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Build report summary
+        if: always()
+        run: |
+          echo "### Build / Lint Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Status: ${{ job.status == 'success' && '✅ Passed' || '❌ Failed' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Checks: fmt, clippy (-D warnings), release build" >> $GITHUB_STEP_SUMMARY
+          echo "- Platform: Ubuntu LTS (GitHub Actions)" >> $GITHUB_STEP_SUMMARY
+
+  # ═══════════════ SECURITY AUDIT ═══════════════
+   #
+   # Cargo.lock is committed; cargo-audit checks it against the RustSec
+   # advisory database. Any advisory fails the build until it is fixed at the
+   # source or explicitly justified in .cargo/audit.toml.
+  security-audit:
+    name: Cargo Audit (dependency advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: cargo-audit
+        run: cargo audit
+
+      - name: Audit report summary
+        if: always()
+        run: |
+          echo "### Cargo Audit Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Status: ${{ job.status == 'success' && '✅ No known advisories' || '❌ Advisories found' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Source: RustSec advisory DB vs. committed Cargo.lock" >> $GITHUB_STEP_SUMMARY

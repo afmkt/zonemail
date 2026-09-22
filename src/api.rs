@@ -681,13 +681,29 @@ pub async fn delete_message(req: &mut Request, _depot: &mut Depot, res: &mut Res
 // ===========================================================================
 
 #[endpoint(
-    summary = "Liveness probe",
+    summary = "Health check",
     responses(
-        (status_code = 200, description = "API is running", body = String)
+        (status_code = 200, description = "API is running", body = ApiResponse<HealthInfo>)
     )
 )]
-async fn hello(res: &mut Response) {
-    res.render(Text::Plain("Zonemail API is running!"));
+async fn health() -> Json<ApiResponse<HealthInfo>> {
+        Json(ApiResponse::ok(HealthInfo {
+            service: "zonemail".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            status: "healthy".to_string(),
+        }))
+    }
+
+/// Payload returned by the health probe, mirrored into the uniform
+/// [`ApiResponse`] success envelope like every other endpoint.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct HealthInfo {
+      /// Service name.
+    pub service: String,
+      /// Semantic version of the running build.
+    pub version: String,
+      /// Probe outcome (e.g. `"healthy"`).
+    pub status: String,
 }
 
 // ===========================================================================
@@ -697,7 +713,7 @@ async fn hello(res: &mut Response) {
 pub fn create_router() -> Router {
     Router::new()
         // Health
-        .get(hello)
+        .push(Router::with_path("health").get(health))
         // Domain CRUD
         .push(
             Router::with_path("domains")

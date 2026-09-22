@@ -1,0 +1,32 @@
+# Example configuration for zonemail.
+#
+# Copy to `zonemail.toml` in the working directory (or bind-mount it into a
+# container at the working dir) and edit. Every field has a default, so an
+# empty / missing file is fine.
+#
+# Any field can be overridden by an environment variable using the prefix
+# `ZONEMAIL` and the `__` separator, e.g.:
+#     ZONEMAIL__API=8081  ZONEMAIL__DNS=53  ZONEMAIL__SMTP=25
+
+# Bind address shared by the API, DNS and SMTP listeners.
+host = "0.0.0.0"
+
+# Listener ports. 53 / 25 are privileged — in a container either run with
+# `--cap-add NET_BIND_SERVICE`, or override to unprivileged ports, e.g.
+# `ZONEMAIL__DNS=5353 ZONEMAIL__SMTP=2525`.
+dns = 53
+smtp = 25
+api = 8081
+
+# Toasty/libsql (turso) data source. A local libsql file is the default;
+# point at a remote turso endpoint with a `libsql://...?authToken=...` URL.
+database_url = "turso:zonemail.db"
+
+# Domains this instance provisions.
+domains = []
+
+# Pre-seeded DNS records (FQDN form).
+records = []
+
+# Pre-provisioned mailboxes (full email addresses).
+mailboxes = []
