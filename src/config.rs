@@ -22,7 +22,7 @@ impl Default for Config {
             host: "0.0.0.0".to_string(),
             dns: 53,
             smtp: 25,
-            api: 8080,
+            api: 8081,
             database_url: "turso:zonemail.db".to_string(),
             domains: Vec::new(),
             records: Vec::new(),

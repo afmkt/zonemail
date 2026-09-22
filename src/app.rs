@@ -35,8 +35,19 @@ impl AppState {
 
         // 2. Automatically push/ensure schema tables are created in the database
         // (Toasty connections support push_schema to set up tables and indices based on models)
-        db.push_schema().await?;
-        info!("Database schema synchronized successfully.");
+        // Wrap in a loop that tolerates 'table already exists' from a previous run;
+        // push_schema emits CREATE TABLE without IF NOT EXISTS.
+        match db.push_schema().await {
+            Ok(()) => info!("Database schema synchronized successfully."),
+            Err(e) => {
+                let msg = format!("{e}");
+                if msg.contains("already exists") {
+                    info!("Database schema already up to date, skipping.");
+                } else {
+                    return Err(Box::new(e));
+                }
+            }
+        }
 
         let mut ctx = Self { db };
 

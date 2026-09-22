@@ -1,17 +1,13 @@
 use salvo::prelude::*;
 use std::sync::Arc;
 use tracing::{error, info};
-use zonemail::api::create_router;
+use zonemail::api::api_with_doc;
 use zonemail::app::AppState;
 use zonemail::config::Config;
 use zonemail::dns::run_dns_server;
 use zonemail::email::run_mail_server;
-use zonemail::send::{run_outbound_worker, OutboundWorkerConfig};
+use zonemail::send::{OutboundWorkerConfig, run_outbound_worker};
 // Define a proper Salvo handler function
-#[handler]
-async fn hello(res: &mut Response) {
-    res.render(Text::Plain("Zonemail API is running!"));
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Database initialized and seeded successfully.");
 
     // 4. Set up Salvo Web & API Router
-    let router = create_router();
+    let router = api_with_doc();
     let router = router.hoop(salvo::affix_state::inject(shared_state.clone()));
 
     // 5. Build Server Address Bindings from Config
@@ -65,15 +61,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-      // The outbound delivery worker is a fire-and-forget poll loop that runs
-      // until the surrounding `select!` is cancelled; it drains the in-database
-      // queue on a timer and never returns under normal operation.
+    // The outbound delivery worker is a fire-and-forget poll loop that runs
+    // until the surrounding `select!` is cancelled; it drains the in-database
+    // queue on a timer and never returns under normal operation.
     let outbound_worker = {
         let db = shared_state.db.clone();
         async move {
             run_outbound_worker(db, OutboundWorkerConfig::default()).await;
-           }
-     };
+        }
+    };
 
     // 7. Run everything together under Tokio Select
     tokio::select! {
