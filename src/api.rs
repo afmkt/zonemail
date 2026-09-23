@@ -31,6 +31,9 @@
 use salvo::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::app::AppState;
+use crate::db::Domain;
+
 // ===========================================================================
 // Shared return data types (borrowed from `janux`)
 // ===========================================================================
@@ -161,12 +164,35 @@ pub fn page_params(req: &Request) -> (usize, usize) {
 // Domain CRUD
 // ===========================================================================
 
-/// Wire view of a [`Domain`](crate::db::Domain).
+/// API DTO / wire projection of a [`Domain`](crate::db::Domain).
+///
+/// This is an internal DTO name with no bearing on the JSON wire shape (which is
+/// fixed by `Serialize` + field names). Only the response *envelope* is shared
+/// with janux; the payload semantics are zonemail's own.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct DomainView {
+pub struct DomainDTO {
     pub id: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl From<&Domain> for DomainDTO {
+    fn from(domain: &Domain) -> Self {
+        DomainDTO {
+            id: domain.id.clone(),
+            created_at: domain.created_at.to_string(),
+            updated_at: domain.updated_at.to_string(),
+          }
+      }
+}
+impl From<Domain> for DomainDTO {
+    fn from(domain: Domain) -> Self {
+        DomainDTO {
+            id: domain.id,
+            created_at: domain.created_at.to_string(),
+            updated_at: domain.updated_at.to_string(),
+          }
+      }
 }
 
 /// Body for creating a domain.
@@ -192,28 +218,38 @@ pub struct PatchDomain {
         ("offset" = Option<usize>, Query, description = "Number of items to skip"),
     ),
     responses(
-        (status_code = 200, description = "All domains", body = ApiResponse<Page<DomainView>>),
+        (status_code = 200, description = "All domains", body = ApiResponse<Page<DomainDTO>>),
         (status_code = 400, description = "Bad request", body = ApiProblem)
     )
 )]
-pub async fn list_domains(req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+pub async fn list_domains(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let (limit, offset) = page_params(req);
-    // TODO: load all domains from the DB and map to `DomainView`.
-    let items: Vec<DomainView> = todo!("load domains into DomainView");
-    res.status_code(StatusCode::OK);
-    res.render(Json(ApiResponse::ok(Page::from_all(items, limit, offset))));
+    // Load every domain and project each row into its API DTO.
+    let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
+    let mut db = state.db.clone();
+    match toasty::query!(Domain).exec(&mut db).await {
+        Ok(domains) => {
+            let items: Vec<DomainDTO> = domains.into_iter().map(DomainDTO::from).collect();
+            res.status_code(StatusCode::OK);
+            res.render(Json(ApiResponse::ok(Page::from_all(items, limit, offset))));
+          }
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(ApiProblem::server_error(&e.to_string())));
+          }
+      }
 }
 
 #[endpoint(
     summary = "Create a new domain",
     request_body = NewDomain,
     responses(
-        (status_code = 200, description = "Domain created successfully", body = ApiResponse<DomainView>),
+        (status_code = 200, description = "Domain created successfully", body = ApiResponse<DomainDTO>),
         (status_code = 400, description = "Bad request", body = ApiProblem),
         (status_code = 409, description = "Domain already exists", body = ApiProblem)
     )
 )]
-pub async fn create_domain(req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+pub async fn create_domain(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let body = match req.parse_json::<NewDomain>().await {
         Ok(b) => b,
         Err(_) => {
@@ -224,12 +260,35 @@ pub async fn create_domain(req: &mut Request, _depot: &mut Depot, res: &mut Resp
             return;
         }
     };
-    // TODO: upsert domain `body.id` in the DB.
-    let domain_id = body.id;
-    let view: DomainView = todo!("persist domain and build DomainView");
-    let _ = domain_id;
-    res.status_code(StatusCode::OK);
-    res.render(Json(ApiResponse::ok(view)));
+    // Create the domain. A duplicate is a 409: the `Domain` model has no
+    // mutable business fields, so a create is the only meaningful transition.
+    let domain_id = body.id.trim().to_string();
+    if domain_id.is_empty() {
+        res.status_code(StatusCode::BAD_REQUEST);
+        res.render(Json(ApiProblem::bad_request(
+              "domain id must not be empty",
+         )));
+        return;
+      }
+    let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
+    let mut db = state.db.clone();
+    if Domain::get_by_id(&mut db, &domain_id).await.is_ok() {
+        res.status_code(StatusCode::CONFLICT);
+        res.render(Json(ApiProblem::conflict(&format!(
+              "domain '{domain_id}' already exists",
+         ))));
+        return;
+      }
+    match toasty::create!(Domain { id: domain_id.clone() }).exec(&mut db).await {
+        Ok(domain) => {
+            res.status_code(StatusCode::OK);
+            res.render(Json(ApiResponse::ok(DomainDTO::from(&domain))));
+          }
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(ApiProblem::server_error(&e.to_string())));
+          }
+      }
 }
 
 #[endpoint(
@@ -238,17 +297,27 @@ pub async fn create_domain(req: &mut Request, _depot: &mut Depot, res: &mut Resp
         ("domain_id" = String, Path, description = "Domain name, e.g. example.com")
     ),
     responses(
-        (status_code = 200, description = "The domain", body = ApiResponse<DomainView>),
+        (status_code = 200, description = "The domain", body = ApiResponse<DomainDTO>),
         (status_code = 404, description = "Domain not found", body = ApiProblem)
     )
 )]
-pub async fn get_domain(req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+pub async fn get_domain(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let domain_id = req.param::<String>("domain_id").unwrap_or_default();
-    // TODO: fetch domain `domain_id` from the DB.
-    let view: DomainView = todo!("fetch domain by id");
-    let _ = domain_id;
+    // Load the domain by id, surfacing a 404 when it is absent.
+    let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
+    let mut db = state.db.clone();
+    let domain = match Domain::get_by_id(&mut db, &domain_id).await {
+        Ok(domain) => domain,
+        Err(_) => {
+            res.status_code(StatusCode::NOT_FOUND);
+            res.render(Json(ApiProblem::not_found(&format!(
+                  "domain '{domain_id}' not found",
+             ))));
+            return;
+          }
+      };
     res.status_code(StatusCode::OK);
-    res.render(Json(ApiResponse::ok(view)));
+    res.render(Json(ApiResponse::ok(DomainDTO::from(&domain))));
 }
 
 #[endpoint(
@@ -258,12 +327,12 @@ pub async fn get_domain(req: &mut Request, _depot: &mut Depot, res: &mut Respons
         ("domain_id" = String, Path, description = "Domain name, e.g. example.com")
     ),
     responses(
-        (status_code = 200, description = "Domain updated", body = ApiResponse<DomainView>),
+        (status_code = 200, description = "Domain updated", body = ApiResponse<DomainDTO>),
         (status_code = 400, description = "Bad request", body = ApiProblem),
         (status_code = 404, description = "Domain not found", body = ApiProblem)
     )
 )]
-pub async fn patch_domain(req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+pub async fn patch_domain(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let domain_id = req.param::<String>("domain_id").unwrap_or_default();
     let body = match req.parse_json::<PatchDomain>().await {
         Ok(b) => b,
@@ -275,11 +344,24 @@ pub async fn patch_domain(req: &mut Request, _depot: &mut Depot, res: &mut Respo
             return;
         }
     };
-    // TODO: apply patch to domain `domain_id`.
-    let view: DomainView = todo!("apply patch and build DomainView");
-    let _ = (domain_id, body);
+    // The current `Domain` model exposes no mutable business columns, so a patch
+    // is a fetch-and-echo of the live row. `body` is parsed for wire
+    // compatibility but not yet acted upon; apply future fields here.
+    let _ = &body;
+    let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
+    let mut db = state.db.clone();
+    let domain = match Domain::get_by_id(&mut db, &domain_id).await {
+        Ok(domain) => domain,
+        Err(_) => {
+            res.status_code(StatusCode::NOT_FOUND);
+            res.render(Json(ApiProblem::not_found(&format!(
+                  "domain '{domain_id}' not found",
+             ))));
+            return;
+          }
+      };
     res.status_code(StatusCode::OK);
-    res.render(Json(ApiResponse::ok(view)));
+    res.render(Json(ApiResponse::ok(DomainDTO::from(&domain))));
 }
 
 #[endpoint(
@@ -292,10 +374,37 @@ pub async fn patch_domain(req: &mut Request, _depot: &mut Depot, res: &mut Respo
         (status_code = 404, description = "Domain not found", body = ApiProblem)
     )
 )]
-pub async fn delete_domain(req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+pub async fn delete_domain(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let domain_id = req.param::<String>("domain_id").unwrap_or_default();
-    // TODO: delete domain `domain_id` from the DB.
-    todo!("delete domain by id");
+    // Fetch first so a missing domain surfaces as a 404: a bare filtered
+    // delete would silently remove zero rows and report success.
+    //
+    // NOTE: this removes the `Domain` row only. Dependents (`Mailbox`,
+    // `Record`, and inbound/outbound links referencing this domain) are not
+    // cascade-deleted here; add that before exposing multi-resource teardown.
+    let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
+    let mut db = state.db.clone();
+    if Domain::get_by_id(&mut db, &domain_id).await.is_err() {
+        res.status_code(StatusCode::NOT_FOUND);
+        res.render(Json(ApiProblem::not_found(&format!(
+              "domain '{domain_id}' not found",
+         ))));
+        return;
+      }
+    match toasty::query!(Domain filter .id == #domain_id)
+          .delete()
+          .exec(&mut db)
+          .await
+      {
+        Ok(()) => {
+            res.status_code(StatusCode::OK);
+            res.render(Json(ApiResponse::ok(())));
+          }
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(ApiProblem::server_error(&e.to_string())));
+          }
+      }
 }
 
 // ===========================================================================
