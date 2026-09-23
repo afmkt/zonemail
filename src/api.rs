@@ -1188,11 +1188,10 @@ pub async fn get_message(req: &mut Request, depot: &mut Depot, res: &mut Respons
 pub async fn delete_message(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let message_id: u64 = req.param::<u64>("message_id").unwrap_or_default();
         // Fetch-first for a proper 404 (a bare filtered delete would silently
-        // remove zero rows and report success), then cascade the `Inbound`/
-        // `Outbound` link rows before the `Message` itself.
-        //
-        // NOTE: `DeliveryStatus` rows tied to those `Outbound` jobs are not
-        // cascade-deleted here; add that once delivery-status retention is decided.
+        // remove zero rows and report success), then delete the `Inbound`/
+        // `Outbound` link rows before the `Message` itself. Each `Outbound`
+        // deletion cascades to its `DeliveryStatus` children automatically
+        // (toasty engine-level cascade via the `#[has_many]` relation).
     let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
     let mut db = state.db.clone();
     if Message::get_by_id(&mut db, &message_id).await.is_err() {
