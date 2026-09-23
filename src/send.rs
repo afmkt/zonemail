@@ -105,8 +105,9 @@ impl Default for OutboundWorkerConfig {
 // Producer
 // ---------------------------------------------------------------------------
 
-/// Persist a message and enqueue it for delivery. Returns the new `Outbound`
-/// id (the queued job). Performs **no** network I/O.
+/// Persist a message and enqueue one delivery job for a single recipient. Returns
+/// `(message_id, outbound_id)` — the stored [`Message`] id and the queued
+/// [`Outbound`] job id. Performs **no** network I/O.
 ///
 /// `sender` must be a provisioned mailbox because `Outbound.sender_id` is a
 /// non-nullable foreign key.
@@ -115,7 +116,7 @@ pub async fn enqueue_outbound(
     sender: &str,
     recipient: &str,
     message: LettreMessage,
-) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
     // 1. Envelope sender (MAIL FROM) and the lossless raw bytes that will be
     // transmitted later, exactly as built.
     let mail_from = message
@@ -186,7 +187,7 @@ pub async fn enqueue_outbound(
     .map_err(|e| err("failed to enqueue Outbound", e))?;
     info!("Enqueued outbound job {} for {sender} -> {recipient}", job.id);
 
-    Ok(job.id)
+    Ok((created.id, job.id))
 }
 
 // ---------------------------------------------------------------------------

@@ -3,7 +3,7 @@
 //! This module defines the *shape* of the REST API: request/response DTOs, the
 //! handler signatures, the status-code + envelope conventions, and the route
 //! wiring. Each handler wires the request to a `toasty` DB read/write (or SMTP
-//! handoff); the one remaining stub is `send_email`.
+//! handoff).
 //!
 //! The response envelope types ([`ApiProblem`], [`ApiResponse`], [`Page`]) are
 //! borrowed verbatim from the `janux` project so the two services speak the same
@@ -11,9 +11,6 @@
 //!
 //! ## Resources
 #![allow(clippy::missing_errors_description)]
-// A couple of pre-fetched inputs are not yet consumed by an implemented handler;
-// silence the resulting noise until the remaining stub is completed.
-#![allow(unused_variables)]
 //!
 //! * **Domain** — `GET/POST /domains`, `GET/PATCH/DELETE /domains/{domain_id}`
 //! * **Mailbox (email address)** — `GET/POST /mailboxes`,
@@ -33,6 +30,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
 use crate::db::{Domain, Inbound, Mailbox, MailboxError, Message, Outbound};
+use crate::send::{enqueue_forward, enqueue_outbound};
+use lettre::message::{header::ContentType, Mailbox as LettreMailbox, Message as LettreMessage};
 
 // ===========================================================================
 // Shared return data types (borrowed from `janux`)
@@ -783,12 +782,12 @@ pub struct SendEmail {
     pub content_type: Option<String>,
 }
 
-/// Result of a successful send: the stored message id and the enqueued delivery
-/// job id (the [`Outbound`](crate::db::Outbound) queue entry).
+/// Result of a successful send: the stored message id plus the enqueued delivery
+/// job ids (one [`Outbound`](crate::db::Outbound) queue entry per recipient).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SendResult {
     pub message_id: u64,
-    pub outbound_id: u64,
+    pub outbound_ids: Vec<u64>,
 }
 
 #[endpoint(
@@ -797,39 +796,156 @@ pub struct SendResult {
     responses(
         (status_code = 200, description = "Message enqueued for delivery", body = ApiResponse<SendResult>),
         (status_code = 400, description = "Bad request", body = ApiProblem),
-        (status_code = 409, description = "Sender is not a provisioned mailbox", body = ApiProblem)
+        (status_code = 409, description = "Sender is not a provisioned mailbox", body = ApiProblem),
+        (status_code = 500, description = "Internal server error", body = ApiProblem)
     )
 )]
-#[allow(unreachable_code)] // `todo!()` diverges; the `res` lines below are the
-// intended shape, kept as a template for the not-yet-built send path.
 pub async fn send_email(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let body = match req.parse_json::<SendEmail>().await {
         Ok(b) => b,
         Err(_) => {
             res.status_code(StatusCode::BAD_REQUEST);
             res.render(Json(ApiProblem::validation_error(
-                "Failed to parse request body",
-            )));
+                  "Failed to parse request body",
+             )));
             return;
+         }
+     };
+
+     // Recipients: `to`, then `cc`, then `bcc`, de-duplicated in first-seen
+     // order. An empty set has nowhere to deliver, so it is a bad request. Since
+     // `Outbound.rcpt_to` carries a single address, each recipient gets its own
+     // `Outbound` job sharing one stored `Message`.
+    let mut recipients: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in body.to.iter().chain(&body.cc).chain(&body.bcc) {
+        if seen.insert(r.to_string()) {
+            recipients.push(r.to_string());
         }
-    };
-// NEXT: implement the send path. Build a `lettre::Message` from `body` and
-//   call `crate::send::enqueue_outbound(&mut db, &body.from, recipient,
-//   message)` to persist the `Message` and enqueue a delivery job. Two design
-//   points are unresolved, so this stays a stub for now:
-//   1. `enqueue_outbound` returns only the `Outbound` id, but `SendResult`
-//      also exposes `message_id` — change it to return `(u64, u64)`.
-//   2. `Outbound.rcpt_to` holds a single address while `SendEmail` carries
-//      `to`/`cc`/`bcc`; how N recipients map to one `SendResult` (one job
-//      per recipient, a `Vec` result, or a joined recipient list) needs a
-//      product decision.
-    let outbox = depot
-        .get_typed_mut::<crate::app::AppState>()
-        .expect("AppState not found");
-     let _ = outbox; // consumed now; the send path (NEXT) uses `outbox`
-    let result: SendResult = todo!("enqueue outbound delivery");
+     }
+    if recipients.is_empty() {
+        res.status_code(StatusCode::BAD_REQUEST);
+        res.render(Json(ApiProblem::bad_request(
+             "no recipients: at least one of to, cc, or bcc is required",
+          )));
+        return;
+     }
+
+     // The envelope sender must be a provisioned mailbox because
+     // `Outbound.sender_id` is a non-nullable foreign key.
+    let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
+    let mut db = state.db.clone();
+    let sender = body.from.to_string();
+    if Mailbox::get_by_id(&mut db, &sender).await.is_err() {
+        res.status_code(StatusCode::CONFLICT);
+        res.render(Json(ApiProblem::conflict(
+             &format!("sender '{sender}' is not a provisioned mailbox"),
+          )));
+        return;
+     }
+
+     // Build the message once; it is shared by every recipient's delivery job.
+    let message = match build_send_message(
+          &sender,
+          &body.to,
+          &body.cc,
+          &body.bcc,
+         body.subject.as_deref(),
+          &body.body,
+         body.content_type.as_deref(),
+      ) {
+        Ok(m) => m,
+        Err(e) => {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(ApiProblem::bad_request(&e.to_string())));
+            return;
+         }
+     };
+
+     // The first recipient persists the `Message` and enqueues its job; the rest
+     // reuse that `message_id` via the forward path (no duplicate `Message` row).
+    let (message_id, first_outbound) =
+        match enqueue_outbound(&mut db, &sender, &recipients[0], message).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                res.render(Json(ApiProblem::server_error(&e.to_string())));
+                return;
+             }
+          };
+    let mut outbound_ids = vec![first_outbound];
+    for recipient in &recipients[1..] {
+        match enqueue_forward(&mut db, message_id, &sender, recipient).await {
+            Ok(outbound_id) => outbound_ids.push(outbound_id),
+            Err(e) => {
+                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                res.render(Json(ApiProblem::server_error(&e.to_string())));
+                return;
+             }
+          }
+      }
+
+    let result = SendResult {
+        message_id,
+        outbound_ids,
+      };
     res.status_code(StatusCode::OK);
     res.render(Json(ApiResponse::ok(result)));
+}
+
+// Build a `lettre` message from the `SendEmail` fields. Recipient strings are
+// `Mailbox`-parsed up front so a malformed address surfaces as a `400` rather than
+// failing later in the delivery worker. `content_type` is optional; a missing one
+// keeps the `text/plain` default `lettre` picks for a plain `String` body.
+fn build_send_message(
+    from: &str,
+    to: &[String],
+    cc: &[String],
+    bcc: &[String],
+    subject: Option<&str>,
+    body: &str,
+    content_type: Option<&str>,
+) -> Result<LettreMessage, Box<dyn std::error::Error + Send + Sync>> {
+    let from = from
+         .parse::<LettreMailbox>()
+         .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(format!("invalid From address '{from}': {e}")))?;
+    let to_addrs = parse_addrs(to)?;
+    let cc_addrs = parse_addrs(cc)?;
+    let bcc_addrs = parse_addrs(bcc)?;
+
+    let mut builder = LettreMessage::builder().from(from);
+    for a in to_addrs {
+        builder = builder.to(a);
+     }
+    for a in cc_addrs {
+        builder = builder.cc(a);
+     }
+    for a in bcc_addrs {
+        builder = builder.bcc(a);
+     }
+
+     // Only override the content type when one is supplied; otherwise let `lettre`
+     // apply its `text/plain` default.
+    if let Some(ct) = content_type {
+        let ct_header = ContentType::parse(ct)
+              .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(format!("invalid content_type '{ct}': {e}")))?;
+        builder = builder.header(ct_header);
+     }
+    if let Some(s) = subject {
+        builder = builder.subject(s.to_string());
+     }
+    builder
+         .body(body.to_string())
+         .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(format!("failed to build message: {e}")))
+}
+
+// Parse a slice of recipient strings into `lettre` addresses, mapping any parse
+// error to a `Send + Sync` box so a bad address yields a `400`.
+fn parse_addrs(addrs: &[String]) -> Result<Vec<LettreMailbox>, Box<dyn std::error::Error + Send + Sync>> {
+    addrs
+         .iter()
+         .map(|s| s.parse::<LettreMailbox>().map_err(Box::<dyn std::error::Error + Send + Sync>::from))
+         .collect()
 }
 
 // ===========================================================================
