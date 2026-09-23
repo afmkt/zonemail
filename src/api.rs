@@ -310,6 +310,7 @@ pub struct MailboxView {
     pub domain_id: String,
     pub created_at: String,
     pub updated_at: String,
+    pub forward_to: Option<String>,
 }
 
 /// Body for creating a mailbox. `id` is the full address; `domain_id` is
@@ -321,6 +322,8 @@ pub struct NewMailbox {
     /// Owning domain. When omitted it is derived from `id`.
     #[serde(default)]
     pub domain_id: Option<String>,
+     #[serde(default)]
+    pub forward_to: Option<String>,
 }
 
 /// Body for patching a mailbox.
@@ -330,6 +333,8 @@ pub struct PatchMailbox {
     pub domain_id: Option<String>,
     #[serde(default)]
     pub note: Option<String>,
+     #[serde(default)]
+    pub forward_to: Option<String>,
 }
 
 #[endpoint(

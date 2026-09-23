@@ -59,8 +59,8 @@ fn addrs_to_strings(addr: &ParsedAddress) -> Vec<String> {
             .filter_map(|a| a.address.as_deref().map(String::from))
             .collect(),
     }
-}
 
+}
 /// Box a `Display` error with a context prefix, pinned to `Send + Sync`.
 ///
 /// Pinning the target to a single concrete `Box<dyn Error + Send + Sync>` both
@@ -179,13 +179,57 @@ pub async fn enqueue_outbound(
             attempts: 0,
             next_attempt_at: None,
             last_error: None,
-        }
-    }
-    .exec(db)
+         }
+     }
+     .exec(db)
     .await
     .map_err(|e| err("failed to enqueue Outbound", e))?;
     info!("Enqueued outbound job {} for {sender} -> {recipient}", job.id);
 
+    Ok(job.id)
+}
+
+// ---------------------------------------------------------------------------
+// Forward
+// ---------------------------------------------------------------------------
+
+/// Enqueue delivery of an existing `Message` to a new recipient address.
+///
+/// This is the *forward* path: the `Message` row already exists (stored by the
+/// inbound handler), so only a new `Outbound` job is created — no duplicate
+/// `Message` row. The job is `Queued` with zero attempts and no backoff, so the
+/// worker picks it up on its next tick.
+///
+/// `sender_id` must be a provisioned `Mailbox.id` because it is the non-nullable
+/// FK `Outbound.sender_id` — the provisioned address that received and forwarded
+/// the mail (e.g. `user@zonemail.net`), not the original external `From:`.
+///
+/// `forward_to` is the external recipient address (e.g. the user's personal inbox).
+///
+pub async fn enqueue_forward(
+    db: &mut toasty::Db,
+    message_id: u64,
+    sender_id: &str,
+    forward_to: &str,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    let job = toasty::create! {
+        Outbound {
+            message_id,
+            rcpt_to: forward_to.to_string(),
+            sender_id: sender_id.to_string(),
+            status: OutboundStatus::Queued,
+            attempts: 0,
+            next_attempt_at: None,
+            last_error: None,
+         }
+     }
+     .exec(db)
+    .await
+    .map_err(|e| err("failed to enqueue forward Outbound", e))?;
+    info!(
+        "Enqueued forward job {} for {sender_id} -> {forward_to} (message {message_id})",
+        job.id
+    );
     Ok(job.id)
 }
 
@@ -350,7 +394,7 @@ async fn deliver_one(
     let message = Message::get_by_id(db, &outbound.message_id).await
         .map_err(|e| err("failed to load Message for Outbound", e))?;
 
-    // Build the envelope from the stored MAIL FROM and the job's RCPT TO.
+          // Build the envelope from the stored MAIL FROM and the job's RCPT TO.
     let envelope = build_envelope(&message.mail_from, &outbound.rcpt_to)?;
 
     // Resolve MX hosts, highest priority first.

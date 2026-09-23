@@ -73,26 +73,29 @@ impl AppState {
             }
         }
 
-        // Seed Mailboxes
-        for mailbox_str in &config.mailboxes {
-            if let Ok(mut mailbox) = Mailbox::try_from(mailbox_str.as_str()) {
-                 // Normalize to lowercase so the open-relay check in `handle_rcpt`
-                 // (which lowercases the incoming address) matches provisioned mailboxes
-                 // regardless of the case used in config.
-                mailbox.id = mailbox.id.to_lowercase();
-                let exists = Mailbox::get_by_id(&mut self.db, &mailbox.id).await.is_ok();
-                if !exists {
-                    toasty::create!(Mailbox {
-                        id: mailbox.id,
-                        domain_id: mailbox.domain_id,
-                    })
-                    .exec(&mut self.db)
-                    .await?;
-                    info!("Seeded mailbox: {}", mailbox_str);
-                }
-            }
-        }
-
+          // Seed Mailboxes
+        for entry in &config.mailboxes {
+            if let Ok(mut mailbox) = Mailbox::try_from(entry.address()) {
+                   // Normalize to lowercase so the open-relay check in `handle_rcpt`
+                   // (which lowercases the incoming address) matches provisioned mailboxes
+                   // regardless of the case used in config.
+                 mailbox.id = mailbox.id.to_lowercase();
+                 let exists = Mailbox::get_by_id(&mut self.db, &mailbox.id).await.is_ok();
+                 if !exists {
+                     toasty::create!(Mailbox {
+                         id: mailbox.id,
+                         domain_id: mailbox.domain_id,
+                         forward_to: entry.forward_to().map(String::from),
+                       })
+                       .exec(&mut self.db)
+                       .await?;
+                     info!(
+                          "Seeded mailbox: {} (forward_to: {:?})",
+                        entry.address(), entry.forward_to()
+                       );
+                   }
+               }
+           }
         // Seed DNS Records
         for record_dto in &config.records {
             let record: Record = record_dto.into();

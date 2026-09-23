@@ -321,6 +321,12 @@ pub struct Mailbox {
     #[index]
     pub domain_id: String,
 
+        // External address to which inbound mail is forwarded.
+        // When `None` the mailbox operates in store-only mode (the default).
+        // SECURITY: only forward to addresses explicitly set via the
+        // authenticated API; never via an untrusted or unauthenticated caller.
+    pub forward_to: Option<String>,
+
     #[auto]
     pub created_at: jiff::Timestamp,
     #[auto]
@@ -357,6 +363,7 @@ impl TryFrom<String> for Mailbox {
         Ok(Mailbox {
             id,
             domain_id,
+            forward_to: None,
             created_at: jiff::Timestamp::now(),
             updated_at: jiff::Timestamp::now(),
             domain: Deferred::default(),
@@ -479,7 +486,7 @@ pub struct Outbound {
     // Human-readable reason for the most recent failure, if any.
     pub last_error: Option<String>,
 
-    #[auto]
+     #[auto]
     pub created_at: jiff::Timestamp,
     #[auto]
     pub updated_at: jiff::Timestamp,

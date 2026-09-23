@@ -28,5 +28,14 @@ domains = []
 # Pre-seeded DNS records (FQDN form).
 records = []
 
-# Pre-provisioned mailboxes (full email addresses).
+# Pre-provisioned mailboxes (full email addresses). Two forms are accepted:
+#
+#   "user@example.com"                          — store-only, no forward
+#   { id = "user2@example.com", forward_to = "user2@gmail.com" } — forwarded
+#
+# Mixing forms is fine:
+# mailboxes = [
+#      "info@example.com",                                  # store-only
+#      { id = "billing@example.com", forward_to = "ops@example.org" },  # forwarded
+# ]
 mailboxes = []

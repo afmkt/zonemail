@@ -3,6 +3,46 @@ use config::{Config as ConfigLoader, ConfigError, Environment, File};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
+/// A config-level mailbox entry. Can be a bare address string or a table that
+/// additionally sets a forward target.
+///
+/// ```toml
+/// # store-only:
+/// mailboxes = ["user@example.com"]
+///
+/// # with forward target:
+/// mailboxes = [
+///     "user@example.com",
+///     { id = "user2@example.com", forward_to = "user2@gmail.com" }
+/// ]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MailboxEntry {
+     /// `"user@example.com"` — store-only, no forward target.
+     Simple(String),
+     /// `{ id = "user@example.com", forward_to = "user@gmail.com" }` — with an
+     /// optional external forward target. `forward_to` defaults to `None`.
+     Detailed { id: String, #[serde(default)] forward_to: Option<String> },
+}
+
+impl MailboxEntry {
+      /// The bare address of this mailbox entry.
+    pub fn address(&self) -> &str {
+        match self {
+            MailboxEntry::Simple(s) => s,
+            MailboxEntry::Detailed { id, .. } => id,
+          }
+      }
+      /// The forward target if set, or `None` for store-only entries.
+    pub fn forward_to(&self) -> Option<&str> {
+        match self {
+            MailboxEntry::Simple(_) => None,
+            MailboxEntry::Detailed { forward_to, .. } => forward_to.as_deref(),
+          }
+     }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -13,7 +53,7 @@ pub struct Config {
     pub database_url: String,
     pub domains: Vec<String>,
     pub records: Vec<RecordDTO>,
-    pub mailboxes: Vec<String>,
+    pub mailboxes: Vec<MailboxEntry>,
 }
 
 impl Default for Config {
@@ -26,7 +66,7 @@ impl Default for Config {
             database_url: "turso:zonemail.db".to_string(),
             domains: Vec::new(),
             records: Vec::new(),
-            mailboxes: Vec::new(),
+            mailboxes: Vec::new(),   // Vec<MailboxEntry> is empty by default
         }
     }
 }

@@ -1,5 +1,6 @@
 use crate::app::AppState;
 use crate::db::{Inbound, Mailbox, Message};
+use crate::send::enqueue_forward;
 use mail_parser::{Address, MessageParser};
 use smtpd::{async_trait, start_server, Error as SmtpError, Response, Session, SmtpConfig};
 use std::net::SocketAddr;
@@ -192,6 +193,25 @@ impl smtpd::SmtpHandler for ZonedMailHandler {
                  })?;
                 info!("Stored inbound link for {recipient} -> message {message_id}");
               }
+
+                  // Forward inbound mail to the user's registered external address.
+                  // Best-effort: a forwarding enqueue failure is logged but does
+                  // NOT abort the SMTP session or discard the stored Inbound row.
+               for recipient in &recipients {
+                   if let Ok(mailbox) = Mailbox::get_by_id(&mut db, recipient).await {
+                       if let Some(ref forward_to) = mailbox.forward_to {
+                           if let Err(e) =
+                               enqueue_forward(&mut db, message_id, recipient, forward_to).await
+                             {
+                               warn!(
+                                     "Forwarding {recipient} -> {forward_to}: failed to enqueue: {e}"
+                                 );
+                             } else {
+                               info!("Forwarding {recipient} -> {forward_to}: enqueued OK");
+                             }
+                        }
+                    }
+                }
 
             Ok(Response::Default)
         }
