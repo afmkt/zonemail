@@ -2,8 +2,8 @@
 //!
 //! This module defines the *shape* of the REST API: request/response DTOs, the
 //! handler signatures, the status-code + envelope conventions, and the route
-//! wiring. The per-handler business logic (DB reads/writes, SMTP handoff, etc.)
-//! is intentionally left as `todo!()` — only the surface is implemented here.
+//! wiring. Each handler wires the request to a `toasty` DB read/write (or SMTP
+//! handoff); the one remaining stub is `send_email`.
 //!
 //! The response envelope types ([`ApiProblem`], [`ApiResponse`], [`Page`]) are
 //! borrowed verbatim from the `janux` project so the two services speak the same
@@ -11,9 +11,9 @@
 //!
 //! ## Resources
 #![allow(clippy::missing_errors_description)]
-// Shape-only skeleton: business logic is left unimplemented, so extracted inputs
-// and not-yet-fetched views are not always consumed. Silence the resulting noise.
-#![allow(unused_variables, unreachable_code)]
+// A couple of pre-fetched inputs are not yet consumed by an implemented handler;
+// silence the resulting noise until the remaining stub is completed.
+#![allow(unused_variables)]
 //!
 //! * **Domain** — `GET/POST /domains`, `GET/PATCH/DELETE /domains/{domain_id}`
 //! * **Mailbox (email address)** — `GET/POST /mailboxes`,
@@ -32,7 +32,7 @@ use salvo::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
-use crate::db::Domain;
+use crate::db::{Domain, Inbound, Mailbox, MailboxError, Message, Outbound};
 
 // ===========================================================================
 // Shared return data types (borrowed from `janux`)
@@ -411,15 +411,43 @@ pub async fn delete_domain(req: &mut Request, depot: &mut Depot, res: &mut Respo
 // Mailbox (email address) CRUD
 // ===========================================================================
 
-/// Wire view of a [`Mailbox`](crate::db::Mailbox) (a provisioned email address).
+/// API DTO / wire projection of a [`Mailbox`](crate::db::Mailbox) (a provisioned
+/// email address).
+///
+/// As with [`DomainDTO`], this is an internal name with no bearing on the JSON
+/// wire shape (which is fixed by `Serialize` + field names); only the response
+/// *envelope* is shared with janux.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct MailboxView {
+pub struct MailboxDTO {
     /// Full address, e.g. `user@example.com`.
     pub id: String,
     pub domain_id: String,
     pub created_at: String,
     pub updated_at: String,
     pub forward_to: Option<String>,
+}
+
+impl From<&Mailbox> for MailboxDTO {
+    fn from(mailbox: &Mailbox) -> Self {
+        MailboxDTO {
+            id: mailbox.id.clone(),
+            domain_id: mailbox.domain_id.clone(),
+            created_at: mailbox.created_at.to_string(),
+            updated_at: mailbox.updated_at.to_string(),
+            forward_to: mailbox.forward_to.clone(),
+        }
+    }
+}
+impl From<Mailbox> for MailboxDTO {
+    fn from(mailbox: Mailbox) -> Self {
+        MailboxDTO {
+            id: mailbox.id,
+            domain_id: mailbox.domain_id,
+            created_at: mailbox.created_at.to_string(),
+            updated_at: mailbox.updated_at.to_string(),
+            forward_to: mailbox.forward_to,
+        }
+    }
 }
 
 /// Body for creating a mailbox. `id` is the full address; `domain_id` is
@@ -454,16 +482,31 @@ pub struct PatchMailbox {
         ("domain_id" = Option<String>, Query, description = "Optional filter by owning domain"),
     ),
     responses(
-        (status_code = 200, description = "All mailboxes", body = ApiResponse<Page<MailboxView>>),
+        (status_code = 200, description = "All mailboxes", body = ApiResponse<Page<MailboxDTO>>),
         (status_code = 400, description = "Bad request", body = ApiProblem)
     )
 )]
-pub async fn list_mailboxes(req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+pub async fn list_mailboxes(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let (limit, offset) = page_params(req);
     let domain_filter = req.query::<String>("domain_id");
-    // TODO: load mailboxes (optionally filtered by `domain_filter`) into MailboxView.
-    let items: Vec<MailboxView> = todo!("load mailboxes into MailboxView");
-    let _ = domain_filter;
+    // Load every mailbox, optionally narrowed to a single owning domain, then
+    // project each row into its DTO.
+    let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
+    let mut db = state.db.clone();
+    let rows: Result<Vec<Mailbox>, _> = match domain_filter {
+        Some(domain_id) => toasty::query!(Mailbox filter .domain_id == #domain_id)
+           .exec(&mut db)
+           .await,
+        None => toasty::query!(Mailbox).exec(&mut db).await,
+    };
+    let items: Vec<MailboxDTO> = match rows {
+        Ok(rows) => rows.into_iter().map(MailboxDTO::from).collect(),
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(ApiProblem::server_error(&e.to_string())));
+            return;
+        }
+    };
     res.status_code(StatusCode::OK);
     res.render(Json(ApiResponse::ok(Page::from_all(items, limit, offset))));
 }
@@ -472,12 +515,12 @@ pub async fn list_mailboxes(req: &mut Request, _depot: &mut Depot, res: &mut Res
     summary = "Create a new mailbox (email address)",
     request_body = NewMailbox,
     responses(
-        (status_code = 200, description = "Mailbox created successfully", body = ApiResponse<MailboxView>),
+        (status_code = 200, description = "Mailbox created successfully", body = ApiResponse<MailboxDTO>),
         (status_code = 400, description = "Bad request", body = ApiProblem),
         (status_code = 409, description = "Mailbox already exists", body = ApiProblem)
     )
 )]
-pub async fn create_mailbox(req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+pub async fn create_mailbox(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let body = match req.parse_json::<NewMailbox>().await {
         Ok(b) => b,
         Err(_) => {
@@ -488,11 +531,69 @@ pub async fn create_mailbox(req: &mut Request, _depot: &mut Depot, res: &mut Res
             return;
         }
     };
-    // TODO: validate the address and upsert the mailbox in the DB.
-    let view: MailboxView = todo!("persist mailbox and build MailboxView");
-    let _ = body;
-    res.status_code(StatusCode::OK);
-    res.render(Json(ApiResponse::ok(view)));
+    // Build and validate the mailbox. The id is the full address; normalize it
+    // to lowercase (matching the seeding path) so open-relay lookups, which
+    // also lowercase, stay consistent. An explicit `domain_id` must agree with
+    // the address's own domain part, otherwise fall back to the derived one.
+    let mailbox_id = body.id.trim().to_lowercase();
+    if mailbox_id.is_empty() {
+        res.status_code(StatusCode::BAD_REQUEST);
+        res.render(Json(ApiProblem::bad_request(
+                "email address must not be empty",
+        )));
+        return;
+    }
+    let mut mailbox = match Mailbox::try_from(mailbox_id) {
+        Ok(mailbox) => mailbox,
+        Err(MailboxError::InvalidFormat) => {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(ApiProblem::bad_request(
+                "invalid email address (missing domain part)",
+            )));
+            return;
+        }
+    };
+    if let Some(domain_id) = body.domain_id {
+        let provided = domain_id.trim().to_lowercase();
+        // Reject a contradictory explicit domain rather than trusting it: the
+        // stored domain must be the address's own domain part.
+        if provided != mailbox.domain_id {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(ApiProblem::bad_request(
+                "domain_id does not match the domain part of the address",
+            )));
+            return;
+        }
+        mailbox.domain_id = provided;
+    }
+    mailbox.forward_to = body.forward_to;
+    let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
+    let mut db = state.db.clone();
+    // Fail on a duplicate address rather than silently upserting an existing mailbox.
+    if Mailbox::get_by_id(&mut db, &mailbox.id).await.is_ok() {
+        res.status_code(StatusCode::CONFLICT);
+        res.render(Json(ApiProblem::conflict(
+                &format!("mailbox '{}' already exists", mailbox.id),
+        )));
+        return;
+    }
+    match toasty::create!(Mailbox {
+        id: mailbox.id.clone(),
+        domain_id: mailbox.domain_id.clone(),
+        forward_to: mailbox.forward_to.clone(),
+     })
+     .exec(&mut db)
+     .await
+     {
+        Ok(created) => {
+            res.status_code(StatusCode::OK);
+            res.render(Json(ApiResponse::ok(MailboxDTO::from(&created))));
+        }
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(ApiProblem::server_error(&e.to_string())));
+        }
+    }
 }
 
 #[endpoint(
@@ -501,17 +602,27 @@ pub async fn create_mailbox(req: &mut Request, _depot: &mut Depot, res: &mut Res
         ("mailbox_id" = String, Path, description = "Full address, e.g. user@example.com, URL-encoded")
     ),
     responses(
-        (status_code = 200, description = "The mailbox", body = ApiResponse<MailboxView>),
+        (status_code = 200, description = "The mailbox", body = ApiResponse<MailboxDTO>),
         (status_code = 404, description = "Mailbox not found", body = ApiProblem)
     )
 )]
-pub async fn get_mailbox(req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+pub async fn get_mailbox(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let mailbox_id = req.param::<String>("mailbox_id").unwrap_or_default();
-    // TODO: fetch mailbox `mailbox_id` from the DB.
-    let view: MailboxView = todo!("fetch mailbox by id");
-    let _ = mailbox_id;
+    // Load the mailbox by its full address, 404 when absent.
+    let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
+    let mut db = state.db.clone();
+    let mailbox = match Mailbox::get_by_id(&mut db, &mailbox_id).await {
+        Ok(mailbox) => mailbox,
+        Err(_) => {
+            res.status_code(StatusCode::NOT_FOUND);
+            res.render(Json(ApiProblem::not_found(
+                    &format!("mailbox '{mailbox_id}' not found"),
+            )));
+            return;
+        }
+    };
     res.status_code(StatusCode::OK);
-    res.render(Json(ApiResponse::ok(view)));
+    res.render(Json(ApiResponse::ok(MailboxDTO::from(&mailbox))));
 }
 
 #[endpoint(
@@ -521,12 +632,12 @@ pub async fn get_mailbox(req: &mut Request, _depot: &mut Depot, res: &mut Respon
         ("mailbox_id" = String, Path, description = "Full address, e.g. user@example.com, URL-encoded")
     ),
     responses(
-        (status_code = 200, description = "Mailbox updated", body = ApiResponse<MailboxView>),
+        (status_code = 200, description = "Mailbox updated", body = ApiResponse<MailboxDTO>),
         (status_code = 400, description = "Bad request", body = ApiProblem),
         (status_code = 404, description = "Mailbox not found", body = ApiProblem)
     )
 )]
-pub async fn patch_mailbox(req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+pub async fn patch_mailbox(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let mailbox_id = req.param::<String>("mailbox_id").unwrap_or_default();
     let body = match req.parse_json::<PatchMailbox>().await {
         Ok(b) => b,
@@ -538,11 +649,71 @@ pub async fn patch_mailbox(req: &mut Request, _depot: &mut Depot, res: &mut Resp
             return;
         }
     };
-    // TODO: apply patch to mailbox `mailbox_id`.
-    let view: MailboxView = todo!("apply patch and build MailboxView");
-    let _ = (mailbox_id, body);
+    // Fetch the target (404 when absent) and apply the optional patch fields:
+    // `forward_to` (partial — `None` leaves it untouched) and an optional
+    // `domain_id` override that must keep matching the address's domain part.
+    // `note` has no backing column and is ignored, as in the `PatchDomain`
+    // placeholder. After persisting we re-read the row so the response carries
+    // the DB-updated timestamps.
+    let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
+    let mut db = state.db.clone();
+    let mut mailbox = match Mailbox::get_by_id(&mut db, &mailbox_id).await {
+        Ok(mailbox) => mailbox,
+        Err(_) => {
+            res.status_code(StatusCode::NOT_FOUND);
+            res.render(Json(ApiProblem::not_found(
+                    &format!("mailbox '{mailbox_id}' not found"),
+            )));
+            return;
+        }
+    };
+    if let Some(domain_id) = body.domain_id {
+        let provided = domain_id.trim().to_lowercase();
+        if provided != mailbox.domain_id {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(ApiProblem::bad_request(
+                "domain_id does not match the domain part of the address",
+            )));
+            return;
+        }
+        mailbox.domain_id = provided;
+    }
+    mailbox.forward_to = body.forward_to.or_else(|| mailbox.forward_to.clone());
+    // Snapshot the post-patch values so the update target (which needs `&mut
+    // mailbox` for its primary key) and the assignment values don't contend for
+    // the same binding.
+    let new_domain_id = mailbox.domain_id.clone();
+    let new_forward_to = mailbox.forward_to.clone();
+    match toasty::update! {
+            mailbox {
+                domain_id: new_domain_id,
+                forward_to: new_forward_to,
+            }
+        }
+        .exec(&mut db)
+        .await
+        {
+        Ok(_) => {}
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(ApiProblem::server_error(&e.to_string())));
+            return;
+        }
+    }
+    // Re-read so the response reflects the stored value, including timestamps.
+    let updated = match Mailbox::get_by_id(&mut db, &mailbox_id).await {
+        Ok(updated) => updated,
+        Err(_) => {
+                // We just wrote this row, so a second miss is a real error.
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(ApiProblem::server_error(
+                    "mailbox vanished after update",
+            )));
+            return;
+        }
+    };
     res.status_code(StatusCode::OK);
-    res.render(Json(ApiResponse::ok(view)));
+    res.render(Json(ApiResponse::ok(MailboxDTO::from(&updated))));
 }
 
 #[endpoint(
@@ -555,10 +726,36 @@ pub async fn patch_mailbox(req: &mut Request, _depot: &mut Depot, res: &mut Resp
         (status_code = 404, description = "Mailbox not found", body = ApiProblem)
     )
 )]
-pub async fn delete_mailbox(req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+pub async fn delete_mailbox(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let mailbox_id = req.param::<String>("mailbox_id").unwrap_or_default();
-    // TODO: delete mailbox `mailbox_id` from the DB.
-    todo!("delete mailbox by id");
+    // Fetch first so a missing mailbox surfaces as a 404 (a bare filtered delete
+    // would silently remove zero rows and still report success).
+    //
+    // NOTE: this removes the `Mailbox` row only. Its `Inbound`/`Outbound` link
+    // rows are not cascade-deleted here; add that before real teardown.
+    let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
+    let mut db = state.db.clone();
+    if Mailbox::get_by_id(&mut db, &mailbox_id).await.is_err() {
+        res.status_code(StatusCode::NOT_FOUND);
+        res.render(Json(ApiProblem::not_found(
+                &format!("mailbox '{mailbox_id}' not found"),
+        )));
+        return;
+    }
+    match toasty::query!(Mailbox filter .id == #mailbox_id)
+             .delete()
+             .exec(&mut db)
+             .await
+        {
+        Ok(()) => {
+            res.status_code(StatusCode::OK);
+            res.render(Json(ApiResponse::ok(())));
+        }
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(ApiProblem::server_error(&e.to_string())));
+        }
+    }
 }
 
 // ===========================================================================
@@ -603,6 +800,8 @@ pub struct SendResult {
         (status_code = 409, description = "Sender is not a provisioned mailbox", body = ApiProblem)
     )
 )]
+#[allow(unreachable_code)] // `todo!()` diverges; the `res` lines below are the
+// intended shape, kept as a template for the not-yet-built send path.
 pub async fn send_email(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let body = match req.parse_json::<SendEmail>().await {
         Ok(b) => b,
@@ -614,15 +813,21 @@ pub async fn send_email(req: &mut Request, depot: &mut Depot, res: &mut Response
             return;
         }
     };
-    // TODO: build the `lettre` message from `body` and call
-    // `crate::send::enqueue_outbound(&mut state.db, &body.from, rcpt, message)`
-    // to persist the message and enqueue delivery, then map the returned
-    // `(message_id, outbound_id)` to `SendResult`.
+// NEXT: implement the send path. Build a `lettre::Message` from `body` and
+//   call `crate::send::enqueue_outbound(&mut db, &body.from, recipient,
+//   message)` to persist the `Message` and enqueue a delivery job. Two design
+//   points are unresolved, so this stays a stub for now:
+//   1. `enqueue_outbound` returns only the `Outbound` id, but `SendResult`
+//      also exposes `message_id` — change it to return `(u64, u64)`.
+//   2. `Outbound.rcpt_to` holds a single address while `SendEmail` carries
+//      `to`/`cc`/`bcc`; how N recipients map to one `SendResult` (one job
+//      per recipient, a `Vec` result, or a joined recipient list) needs a
+//      product decision.
     let outbox = depot
         .get_typed_mut::<crate::app::AppState>()
         .expect("AppState not found");
+     let _ = outbox; // consumed now; the send path (NEXT) uses `outbox`
     let result: SendResult = todo!("enqueue outbound delivery");
-    let _ = outbox;
     res.status_code(StatusCode::OK);
     res.render(Json(ApiResponse::ok(result)));
 }
@@ -632,7 +837,7 @@ pub async fn send_email(req: &mut Request, depot: &mut Depot, res: &mut Response
 // ===========================================================================
 
 /// Direction filter for listing a mailbox's messages.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub enum MessageDirection {
     /// Every message the mailbox sent or received.
     Both,
@@ -645,7 +850,7 @@ pub enum MessageDirection {
 /// Wire view of a [`Message`](crate::db::Message), annotated with which way it
 /// flowed relative to a mailbox.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct MessageView {
+pub struct MessageDTO {
     pub id: u64,
     /// `inbound` / `outbound` — empty when the message is shown in isolation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -669,6 +874,44 @@ pub struct MessageView {
     pub updated_at: String,
 }
 
+impl From<&Message> for MessageDTO {
+    fn from(message: &Message) -> Self {
+        MessageDTO {
+            id: message.id,
+            direction: None,
+            mail_from: message.mail_from.clone(),
+            subject: message.subject.clone(),
+            message_id_header: message.message_id_header.clone(),
+            content_type: message.content_type.clone(),
+            from_address: message.from_address.clone(),
+            to: message.to.clone(),
+            cc: message.cc.clone(),
+            bcc: message.bcc.clone(),
+            created_at: message.created_at.to_string(),
+            updated_at: message.updated_at.to_string(),
+        }
+    }
+}
+
+impl From<Message> for MessageDTO {
+    fn from(message: Message) -> Self {
+        MessageDTO {
+            id: message.id,
+            direction: None,
+            mail_from: message.mail_from,
+            subject: message.subject,
+            message_id_header: message.message_id_header,
+            content_type: message.content_type,
+            from_address: message.from_address,
+            to: message.to,
+            cc: message.cc,
+            bcc: message.bcc,
+            created_at: message.created_at.to_string(),
+            updated_at: message.updated_at.to_string(),
+        }
+    }
+}
+
 /// Per-message listing filters for a mailbox.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ListMessagesQuery {
@@ -688,23 +931,35 @@ pub struct ListMessagesQuery {
         ("offset" = Option<usize>, Query, description = "Number of items to skip"),
     ),
     responses(
-        (status_code = 200, description = "Messages of the mailbox", body = ApiResponse<Page<MessageView>>),
+        (status_code = 200, description = "Messages of the mailbox", body = ApiResponse<Page<MessageDTO>>),
         (status_code = 400, description = "Bad request", body = ApiProblem),
         (status_code = 404, description = "Mailbox not found", body = ApiProblem)
     )
 )]
-pub async fn list_mailbox_messages(req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+pub async fn list_mailbox_messages(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let mailbox_id = req.param::<String>("mailbox_id").unwrap_or_default();
     let query = req.parse_queries::<ListMessagesQuery>().ok();
+        // Capture the direction filter before `query` is consumed below.
+    let direction = query.as_ref().and_then(|q| q.direction.clone());
     let (limit, offset) = if let Some(q) = query {
         (q.limit.unwrap_or(DEFAULT_PAGE_LIMIT), q.offset.unwrap_or(0))
     } else {
         page_params(req)
     };
-    // TODO: join `Inbound`/`Outbound` (filtered by `direction`) against
-    // `Message` for `mailbox_id`, then map to `MessageView`.
-    let items: Vec<MessageView> = todo!("load messages for mailbox");
-    let _ = (mailbox_id, limit, offset);
+        // A 404 for an unprovisioned mailbox rather than a misleading empty list.
+    let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
+    let mut db = state.db.clone();
+    if !ensure_mailbox_exists(&mut db, &mailbox_id, res).await {
+        return;
+      }
+    let items = match load_mailbox_messages(&mut db, &mailbox_id, direction).await {
+        Ok(items) => items,
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(ApiProblem::server_error(&e.to_string())));
+            return;
+          }
+      };
     res.status_code(StatusCode::OK);
     res.render(Json(ApiResponse::ok(Page::from_all(items, limit, offset))));
 }
@@ -717,17 +972,28 @@ pub async fn list_mailbox_messages(req: &mut Request, _depot: &mut Depot, res: &
         ("offset" = Option<usize>, Query, description = "Number of items to skip"),
     ),
     responses(
-        (status_code = 200, description = "Inbound messages of the mailbox", body = ApiResponse<Page<MessageView>>),
+        (status_code = 200, description = "Inbound messages of the mailbox", body = ApiResponse<Page<MessageDTO>>),
         (status_code = 400, description = "Bad request", body = ApiProblem),
         (status_code = 404, description = "Mailbox not found", body = ApiProblem)
     )
 )]
-pub async fn list_mailbox_inbox(req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+pub async fn list_mailbox_inbox(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let mailbox_id = req.param::<String>("mailbox_id").unwrap_or_default();
     let (limit, offset) = page_params(req);
-    // TODO: join `Inbound` against `Message` for `mailbox_id`.
-    let items: Vec<MessageView> = todo!("load inbound messages for mailbox");
-    let _ = (mailbox_id, limit, offset);
+        // 404 for an unprovisioned mailbox, then load its received (inbox) messages.
+    let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
+    let mut db = state.db.clone();
+    if !ensure_mailbox_exists(&mut db, &mailbox_id, res).await {
+        return;
+      }
+    let items = match load_mailbox_messages(&mut db, &mailbox_id, Some(MessageDirection::Inbound)).await {
+        Ok(items) => items,
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(ApiProblem::server_error(&e.to_string())));
+            return;
+          }
+      };
     res.status_code(StatusCode::OK);
     res.render(Json(ApiResponse::ok(Page::from_all(items, limit, offset))));
 }
@@ -740,17 +1006,28 @@ pub async fn list_mailbox_inbox(req: &mut Request, _depot: &mut Depot, res: &mut
         ("offset" = Option<usize>, Query, description = "Number of items to skip"),
     ),
     responses(
-        (status_code = 200, description = "Outbound messages of the mailbox", body = ApiResponse<Page<MessageView>>),
+        (status_code = 200, description = "Outbound messages of the mailbox", body = ApiResponse<Page<MessageDTO>>),
         (status_code = 400, description = "Bad request", body = ApiProblem),
         (status_code = 404, description = "Mailbox not found", body = ApiProblem)
     )
 )]
-pub async fn list_mailbox_sent(req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+pub async fn list_mailbox_sent(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let mailbox_id = req.param::<String>("mailbox_id").unwrap_or_default();
     let (limit, offset) = page_params(req);
-    // TODO: join `Outbound` against `Message` for `mailbox_id`.
-    let items: Vec<MessageView> = todo!("load outbound messages for mailbox");
-    let _ = (mailbox_id, limit, offset);
+        // 404 for an unprovisioned mailbox, then load its sent (outbox) messages.
+    let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
+    let mut db = state.db.clone();
+    if !ensure_mailbox_exists(&mut db, &mailbox_id, res).await {
+        return;
+      }
+    let items = match load_mailbox_messages(&mut db, &mailbox_id, Some(MessageDirection::Outbound)).await {
+        Ok(items) => items,
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(ApiProblem::server_error(&e.to_string())));
+            return;
+          }
+      };
     res.status_code(StatusCode::OK);
     res.render(Json(ApiResponse::ok(Page::from_all(items, limit, offset))));
 }
@@ -761,17 +1038,25 @@ pub async fn list_mailbox_sent(req: &mut Request, _depot: &mut Depot, res: &mut 
         ("message_id" = u64, Path, description = "Numeric message id")
     ),
     responses(
-        (status_code = 200, description = "The message", body = ApiResponse<MessageView>),
+        (status_code = 200, description = "The message", body = ApiResponse<MessageDTO>),
         (status_code = 404, description = "Message not found", body = ApiProblem)
     )
 )]
-pub async fn get_message(req: &mut Request, _depot: &mut Depot, res: &mut Response) {
-    let message_id = req.param::<usize>("message_id").unwrap_or_default();
-    // TODO: fetch `Message` by `message_id` and map to `MessageView`.
-    let view: MessageView = todo!("fetch message by id");
-    let _ = message_id;
+pub async fn get_message(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let message_id: u64 = req.param::<u64>("message_id").unwrap_or_default();
+        // Load the message by id, 404 when absent.
+    let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
+    let mut db = state.db.clone();
+    let message = match Message::get_by_id(&mut db, &message_id).await {
+        Ok(message) => message,
+        Err(_) => {
+            res.status_code(StatusCode::NOT_FOUND);
+            res.render(Json(ApiProblem::not_found(&format!("message '{message_id}' not found"))));
+            return;
+          }
+      };
     res.status_code(StatusCode::OK);
-    res.render(Json(ApiResponse::ok(view)));
+    res.render(Json(ApiResponse::ok(MessageDTO::from(&message))));
 }
 
 #[endpoint(
@@ -784,10 +1069,102 @@ pub async fn get_message(req: &mut Request, _depot: &mut Depot, res: &mut Respon
         (status_code = 404, description = "Message not found", body = ApiProblem)
     )
 )]
-pub async fn delete_message(req: &mut Request, _depot: &mut Depot, res: &mut Response) {
-    let message_id = req.param::<usize>("message_id").unwrap_or_default();
-    // TODO: delete `Message` by `message_id` (and its `Inbound`/`Outbound` links).
-    todo!("delete message by id");
+pub async fn delete_message(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let message_id: u64 = req.param::<u64>("message_id").unwrap_or_default();
+        // Fetch-first for a proper 404 (a bare filtered delete would silently
+        // remove zero rows and report success), then cascade the `Inbound`/
+        // `Outbound` link rows before the `Message` itself.
+        //
+        // NOTE: `DeliveryStatus` rows tied to those `Outbound` jobs are not
+        // cascade-deleted here; add that once delivery-status retention is decided.
+    let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
+    let mut db = state.db.clone();
+    if Message::get_by_id(&mut db, &message_id).await.is_err() {
+        res.status_code(StatusCode::NOT_FOUND);
+        res.render(Json(ApiProblem::not_found(&format!("message '{message_id}' not found"))));
+        return;
+      }
+        // Remove link rows first so no dangling references remain.
+    if let Err(e) = toasty::query!(Inbound filter .message_id == #message_id).delete().exec(&mut db).await {
+        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        res.render(Json(ApiProblem::server_error(&e.to_string())));
+        return;
+      }
+    if let Err(e) = toasty::query!(Outbound filter .message_id == #message_id).delete().exec(&mut db).await {
+        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        res.render(Json(ApiProblem::server_error(&e.to_string())));
+        return;
+      }
+    match toasty::query!(Message filter .id == #message_id).delete().exec(&mut db).await {
+        Ok(()) => {
+            res.status_code(StatusCode::OK);
+            res.render(Json(ApiResponse::ok(())));
+          }
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(ApiProblem::server_error(&e.to_string())));
+          }
+      }
+}
+
+// ===========================================================================
+// Per-mailbox message loading (shared by the message-listing handlers)
+// ===========================================================================
+
+/// Render a 404 and return `false` when `mailbox_id` is not provisioned, so an
+/// unknown mailbox never masquerades as an empty inbox/outbox.
+async fn ensure_mailbox_exists(db: &mut toasty::Db, mailbox_id: &str, res: &mut Response) -> bool {
+    match Mailbox::get_by_id(db, &mailbox_id.to_lowercase()).await {
+        Ok(_) => true,
+        Err(_) => {
+            res.status_code(StatusCode::NOT_FOUND);
+            res.render(Json(ApiProblem::not_found(&format!("mailbox '{mailbox_id}' not found"))));
+            false
+          }
+      }
+}
+
+/// Load the [`MessageDTO`]s associated with `mailbox_id` for the requested
+/// [`MessageDirection`]. `Inbound` lists received mail (the mailbox as the
+/// `rcpt_to` of an [`Inbound`] link); `Outbound` lists sent mail (the mailbox as
+/// the `sender_id` of an [`Outbound`] link); `None`/`Both` unions the two, de-
+/// duplicated by message id. Each returned DTO carries its `direction`.
+async fn load_mailbox_messages(
+    db: &mut toasty::Db, mailbox_id: &str, direction: Option<MessageDirection>,
+) -> Result<Vec<MessageDTO>, toasty::Error> {
+    let want_in = !matches!(direction, Some(MessageDirection::Outbound));
+    let want_out = !matches!(direction, Some(MessageDirection::Inbound));
+    let mut ids: Vec<u64> = Vec::new();
+    let mut dirs: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    if want_in {
+        let key = mailbox_id.to_lowercase();
+        let inbounds = toasty::query!(Inbound filter .rcpt_to == #key).exec(db).await?;
+        for row in inbounds {
+            ids.push(row.message_id);
+            dirs.insert(row.message_id, "inbound".to_string());
+          }
+       }
+    if want_out {
+        let key = mailbox_id.to_lowercase();
+        let outbounds = toasty::query!(Outbound filter .sender_id == #key).exec(db).await?;
+        for row in outbounds {
+            ids.push(row.message_id);
+            dirs.insert(row.message_id, "outbound".to_string());
+          }
+       }
+    // A message can be both received and sent; collapse its duplicate id.
+    ids.sort_unstable();
+    ids.dedup();
+    let mut items: Vec<MessageDTO> = Vec::new();
+    for id in ids {
+        // Skip link rows whose `Message` has been removed.
+        if let Ok(message) = Message::get_by_id(db, &id).await {
+            let mut dto = MessageDTO::from(&message);
+            dto.direction = dirs.get(&id).cloned();
+            items.push(dto);
+          }
+       }
+     Ok(items)
 }
 
 // ===========================================================================
