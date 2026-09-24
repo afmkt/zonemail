@@ -15,6 +15,8 @@
 //! * **Domain** — `GET/POST /domains`, `GET/PATCH/DELETE /domains/{domain_id}`
 //! * **Mailbox (email address)** — `GET/POST /mailboxes`,
 //!   `GET/PATCH/DELETE /mailboxes/{mailbox_id}`
+//! * **DNS record** — `GET/POST /records`,
+//!     `GET/PATCH/DELETE /records/{record_id}`
 //! * **Send email** — `POST /mail`
 //! * **Service control** — `GET /services`,
 //!   `POST /services/{service}/start`, `POST /services/{service}/stop`,
@@ -33,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::app::AppState;
-use crate::db::{Domain, Inbound, Mailbox, MailboxError, Message, Outbound};
+use crate::db::{Domain, Inbound, Mailbox, MailboxError, Message, Outbound, Record, RecordType};
 use crate::send::{enqueue_forward, enqueue_outbound};
 use crate::services::{BootMode, Service, ServiceManager, ServiceReport, ServiceResult};
 use lettre::message::{header::ContentType, Mailbox as LettreMailbox, Message as LettreMessage};
@@ -760,6 +762,490 @@ pub async fn delete_mailbox(req: &mut Request, depot: &mut Depot, res: &mut Resp
             res.render(Json(ApiProblem::server_error(&e.to_string())));
         }
     }
+}
+
+// ===========================================================================
+// DNS Record CRUD
+// ===========================================================================
+
+/// Default time-to-live (seconds) applied to a created record that omits `ttl`.
+const DEFAULT_RECORD_TTL: u32 = 3600;
+
+/// `serde` default for the optional `ttl` field on record bodies.
+fn default_record_ttl() -> u32 {
+    DEFAULT_RECORD_TTL
+}
+
+/// Render a [`RecordType`] as its canonical enum name (e.g. `"MX"`) for the wire
+/// form. Uses `serde` so every variant has a stable, round-trippable name
+/// without a separate `Display` impl in the salvo-free `db` module.
+fn record_type_to_string(rt: RecordType) -> String {
+    serde_json::to_string(&rt)
+          .map(|s| s.trim_matches('"').to_string())
+          .unwrap_or_else(|_| "Unknown".to_string())
+}
+
+/// Parse a wire `record_type` string (e.g. `"MX"`) back to a [`RecordType`]. An
+/// unrecognized type yields a 400 so callers get a clear message instead of a
+/// deserialization failure inside a request body.
+fn parse_record_type(s: &str) -> Result<RecordType, ApiProblem> {
+       // Wrap the bare type name in quotes so serde sees a valid JSON string literal.
+    let json = format!("\"{s}\"");
+    serde_json::from_str::<RecordType>(&json)
+            .map_err(|_e| ApiProblem::bad_request(&format!("unknown record type '{s}'")))
+}
+
+/// API DTO / wire projection of a [`Record`](crate::db::Record) (a stored DNS
+/// record). As with [`DomainDTO`]/[`MailboxDTO`], the name is internal and has
+/// no bearing on the JSON wire shape; only the response *envelope* is shared.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct RecordApiDTO {
+     /// Auto-generated primary key.
+    pub id: u64,
+    pub domain_id: String,
+    pub record_type: String,
+    pub value: String,
+    pub ttl: u32,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl From<&Record> for RecordApiDTO {
+    fn from(record: &Record) -> Self {
+        RecordApiDTO {
+            id: record.id,
+            domain_id: record.domain_id.clone(),
+            record_type: record_type_to_string(record.record_type),
+            value: record.value.clone(),
+            ttl: record.ttl,
+            created_at: record.created_at.to_string(),
+            updated_at: record.updated_at.to_string(),
+         }
+     }
+}
+impl From<Record> for RecordApiDTO {
+    fn from(record: Record) -> Self {
+        RecordApiDTO::from(&record)
+     }
+}
+
+/// Body for creating a DNS record. `record_type` is a `RecordType` (deserialized
+/// from its enum name, e.g. `"MX"`), so an unknown/typo'd type is a 400.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct NewRecord {
+     /// Owning domain, e.g. `example.com`; must already be provisioned.
+    pub domain_id: String,
+     /// DNS record type name, e.g. `MX`, `A`, `TXT`, `PTR`.
+    pub record_type: String,
+     /// The record's RDATA-as-text value, e.g. `10 mail.example.com`.
+    pub value: String,
+     /// Time-to-live in seconds; defaults to [`DEFAULT_RECORD_TTL`] when omitted.
+     #[serde(default = "default_record_ttl")]
+    pub ttl: u32,
+}
+
+/// Body for patching a DNS record. Every field is optional; an omitted field is
+/// left untouched.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PatchRecord {
+     #[serde(default)]
+    pub domain_id: Option<String>,
+     #[serde(default)]
+    pub record_type: Option<String>,
+     #[serde(default)]
+    pub value: Option<String>,
+     #[serde(default)]
+    pub ttl: Option<u32>,
+}
+
+/// Shared validation for the mutable record fields. Returns an `ApiProblem` on
+/// the first offending field: a missing/empty record value, or a `domain_id`
+/// that names a domain that has not been provisioned.
+async fn validate_record_fields(
+    db: &mut toasty::Db,
+    domain_id: &str,
+    value: &str,
+) -> Result<(), ApiProblem> {
+    if value.trim().is_empty() {
+        return Err(ApiProblem::bad_request("value must not be empty"));
+     }
+     // A record must reference a provisioned domain so the DNS server can answer
+     // against a real zone rather than an orphan FQDN.
+    if Domain::get_by_id(db, domain_id).await.is_err() {
+        return Err(ApiProblem::bad_request(&format!(
+               "domain '{domain_id}' is not provisioned",
+          )));
+     }
+    Ok(())
+}
+
+#[endpoint(
+    summary = "List all DNS records",
+    parameters(
+         ("limit" = Option<usize>, Query, description = "Max items per page (server-enforced default and cap)"),
+         ("offset" = Option<usize>, Query, description = "Number of items to skip"),
+         ("domain_id" = Option<String>, Query, description = "Optional filter by owning domain"),
+         ("record_type" = Option<String>, Query, description = "Optional filter by record type"),
+     ),
+    responses(
+         (status_code = 200, description = "All DNS records", body = ApiResponse<Page<RecordApiDTO>>),
+         (status_code = 400, description = "Bad request", body = ApiProblem)
+     )
+)]
+pub async fn list_records(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let (limit, offset) = page_params(req);
+    let domain_filter =
+         req.query::<String>("domain_id").map(|d| d.trim().to_lowercase());
+    let type_filter: Option<RecordType> = match req.query::<String>("record_type") {
+        Some(raw) => match parse_record_type(raw.trim()) {
+            Ok(t)   => Some(t),
+            Err(problem) => {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(problem));
+                return;
+              }
+          },
+        None => None,
+       };
+     // Load every stored record, then narrow in memory by the optional filters:
+     // a domain match on the normalized id and an exact record-type match.
+    let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
+    let mut db = state.db.clone();
+    let rows: Result<Vec<Record>, _> = toasty::query!(Record).exec(&mut db).await;
+    let items: Vec<RecordApiDTO> = match rows {
+        Ok(records) => records
+            .into_iter()
+            .filter(|r| match &domain_filter {
+                Some(d) => r.domain_id.eq_ignore_ascii_case(d),
+                None => true,
+             })
+            .filter(|r| match type_filter {
+                Some(t) => r.record_type == t,
+                None => true,
+             })
+            .map(RecordApiDTO::from)
+            .collect(),
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(ApiProblem::server_error(&e.to_string())));
+            return;
+         }
+     };
+    res.status_code(StatusCode::OK);
+    res.render(Json(ApiResponse::ok(Page::from_all(items, limit, offset))));
+}
+
+#[endpoint(
+    summary = "Create a new DNS record",
+    request_body = NewRecord,
+    responses(
+         (status_code = 200, description = "DNS record created successfully", body = ApiResponse<RecordApiDTO>),
+         (status_code = 400, description = "Bad request", body = ApiProblem),
+         (status_code = 409, description = "An equivalent record already exists", body = ApiProblem)
+     )
+)]
+pub async fn create_record(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let body = match req.parse_json::<NewRecord>().await {
+        Ok(b) => b,
+        Err(_) => {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(ApiProblem::validation_error(
+                 "Failed to parse request body",
+             )));
+            return;
+         }
+     };
+     // Normalize the owning domain (case-insensitive) and the value, then
+     // validate: a non-empty value and a provisioned owning domain.
+    let domain_id = body.domain_id.trim().to_lowercase();
+    let value = body.value.trim().to_string();
+       // Parse the wire record-type name string into a `RecordType`; an unknown
+       // name is a 400 so callers get a clear message.
+    let record_type = match parse_record_type(body.record_type.trim()) {
+        Ok(record_type) => record_type,
+        Err(problem) => {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(problem));
+            return;
+             }
+      };
+    let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
+    let mut db = state.db.clone();
+    if let Err(problem) =
+         validate_record_fields(&mut db, &domain_id, &value).await
+     {
+        res.status_code(StatusCode::from_u16(problem.status).unwrap_or(StatusCode::BAD_REQUEST));
+        res.render(Json(problem));
+        return;
+     }
+        // The `(domain_id, record_type, value)` triple is unique. A pre-check
+        // scoped to the owning domain's records (the `domain_id` index) surfaces
+        // a duplicate as a 409 rather than letting the DB constraint 500. The
+        // record-type/value match is done in Rust, avoiding an interpolated record
+        // type, so exact values can be compared directly.
+    // Clone the domain for the scoped query so the original stays in scope for
+    // the conflict message and the create below.
+    let dup_domain = domain_id.clone();
+    let duplicates = toasty::query!(Record filter .domain_id == #dup_domain).exec(&mut db).await;
+    match duplicates {
+        Ok(rows) => {
+            if rows.iter().any(|r| r.record_type == record_type && r.value == value) {
+                res.status_code(StatusCode::CONFLICT);
+                res.render(Json(ApiProblem::conflict(&format!(
+                         "a {} record for '{domain_id}' with this value already exists",
+                    record_type_to_string(record_type),
+                 ))));
+                return;
+             }
+         }
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(ApiProblem::server_error(&e.to_string())));
+            return;
+         }
+     }
+    match toasty::create!(Record {
+            domain_id: domain_id.clone(),
+            record_type: record_type,
+            value: value.clone(),
+            ttl: body.ttl,
+          })
+          .exec(&mut db)
+          .await
+     {
+        Ok(created) => {
+            res.status_code(StatusCode::OK);
+            res.render(Json(ApiResponse::ok(RecordApiDTO::from(&created))));
+         }
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(ApiProblem::server_error(&e.to_string())));
+         }
+     }
+}
+
+#[endpoint(
+    summary = "Get a single DNS record",
+    parameters(
+         ("record_id" = u64, Path, description = "Record primary key")
+     ),
+    responses(
+         (status_code = 200, description = "The DNS record", body = ApiResponse<RecordApiDTO>),
+         (status_code = 404, description = "Record not found", body = ApiProblem)
+     )
+)]
+pub async fn get_record(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+        let record_id = match req.param::<u64>("record_id") {
+        Some(id) => id,
+        None => {
+            // A missing or non-numeric id names no record.
+            res.status_code(StatusCode::NOT_FOUND);
+            res.render(Json(ApiProblem::not_found("record not found")));
+            return;
+          }
+      };
+    let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
+    let mut db = state.db.clone();
+    let record = match Record::get_by_id(&mut db, &record_id).await {
+        Ok(record) => record,
+        Err(_) => {
+            res.status_code(StatusCode::NOT_FOUND);
+            res.render(Json(ApiProblem::not_found(&format!(
+                   "record '{record_id}' not found",
+              ))));
+            return;
+         }
+     };
+    res.status_code(StatusCode::OK);
+    res.render(Json(ApiResponse::ok(RecordApiDTO::from(&record))));
+}
+
+#[endpoint(
+    summary = "Update a DNS record",
+    request_body = PatchRecord,
+    parameters(
+         ("record_id" = u64, Path, description = "Record primary key")
+     ),
+    responses(
+         (status_code = 200, description = "DNS record updated", body = ApiResponse<RecordApiDTO>),
+         (status_code = 400, description = "Bad request", body = ApiProblem),
+         (status_code = 404, description = "Record not found", body = ApiProblem),
+         (status_code = 409, description = "An equivalent record already exists", body = ApiProblem)
+     )
+)]
+pub async fn patch_record(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+        let record_id = match req.param::<u64>("record_id") {
+        Some(id) => id,
+        None => {
+            // A missing or non-numeric id names no record.
+            res.status_code(StatusCode::NOT_FOUND);
+            res.render(Json(ApiProblem::not_found("record not found")));
+            return;
+          }
+      };
+    let body = match req.parse_json::<PatchRecord>().await {
+        Ok(b) => b,
+        Err(_) => {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(ApiProblem::validation_error(
+                   "Failed to parse request body",
+              )));
+            return;
+         }
+     };
+     // Fetch the target (404 when absent) and layer the optional patch fields
+     // over the stored row, normalizing the domain/value like create does.
+    let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
+    let mut db = state.db.clone();
+    let mut record = match Record::get_by_id(&mut db, &record_id).await {
+        Ok(record) => record,
+        Err(_) => {
+            res.status_code(StatusCode::NOT_FOUND);
+            res.render(Json(ApiProblem::not_found(&format!(
+                   "record '{record_id}' not found",
+              ))));
+            return;
+         }
+     };
+    if let Some(domain_id) = body.domain_id {
+        record.domain_id = domain_id.trim().to_lowercase();
+     }
+    if let Some(record_type) = body.record_type {
+         // The type arrives as a name string; parse it (400 on a bad name).
+         match parse_record_type(record_type.trim()) {
+            Ok(parsed) => record.record_type = parsed,
+            Err(problem) => {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(problem));
+                return;
+              }
+          }
+     }
+    if let Some(value) = body.value {
+        record.value = value.trim().to_string();
+     }
+    if let Some(ttl) = body.ttl {
+        record.ttl = ttl;
+     }
+     // Re-validate the (possibly changed) fields: non-empty value + provisioned
+     // domain.
+    if let Err(problem) =
+         validate_record_fields(&mut db, &record.domain_id, &record.value).await
+     {
+        res.status_code(StatusCode::from_u16(problem.status).unwrap_or(StatusCode::BAD_REQUEST));
+        res.render(Json(problem));
+        return;
+     }
+      // Snapshot the post-patch values so the collision check and the update
+      // target (which needs `&mut record` for its primary key) read one
+      // consistent set; we then re-read so the response carries fresh timestamps.
+    let new_domain_id = record.domain_id.clone();
+    let new_record_type = record.record_type;
+    let new_value = record.value.clone();
+    let new_ttl = record.ttl;
+        // Reject a patch that collides with a *different* existing record on the
+        // unique (domain_id, record_type, value) triple. Scoped to the owning
+        // domain's records, the self-exclusion and type/value match happen in
+        // Rust so a record type need not be interpolated; a fresh `collide_domain`
+        // clone keeps the original in scope for the update below.
+    let collide_domain = new_domain_id.clone();
+    let collisions = toasty::query!(Record filter .domain_id == #collide_domain).exec(&mut db).await;
+    match collisions {
+        Ok(rows) => {
+            if rows
+                  .iter()
+                  .any(|r| r.id != record_id && r.record_type == new_record_type && r.value == new_value)
+              {
+                res.status_code(StatusCode::CONFLICT);
+                res.render(Json(ApiProblem::conflict(
+                         "a record with the same domain, type, and value already exists", )));
+                return;
+              }
+          }
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(ApiProblem::server_error(&e.to_string())));
+            return;
+          }
+      }
+    match toasty::update! {
+            record {
+                domain_id: new_domain_id,
+                record_type: new_record_type,
+                value: new_value,
+                ttl: new_ttl,
+             }
+         }
+         .exec(&mut db)
+         .await
+     {
+        Ok(_) => {}
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(ApiProblem::server_error(&e.to_string())));
+            return;
+         }
+     }
+    let updated = match Record::get_by_id(&mut db, &record_id).await {
+        Ok(updated) => updated,
+        Err(_) => {
+                 // We just wrote this row, so a second miss is a real error.
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(ApiProblem::server_error(
+                   "record vanished after update",
+             )));
+            return;
+         }
+     };
+    res.status_code(StatusCode::OK);
+    res.render(Json(ApiResponse::ok(RecordApiDTO::from(&updated))));
+}
+
+#[endpoint(
+    summary = "Delete a DNS record",
+    parameters(
+         ("record_id" = u64, Path, description = "Record primary key")
+     ),
+    responses(
+         (status_code = 200, description = "DNS record deleted successfully", body = ApiResponse<()>),
+         (status_code = 404, description = "Record not found", body = ApiProblem)
+     )
+)]
+pub async fn delete_record(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+        let record_id = match req.param::<u64>("record_id") {
+        Some(id) => id,
+        None => {
+            // A missing or non-numeric id names no record.
+            res.status_code(StatusCode::NOT_FOUND);
+            res.render(Json(ApiProblem::not_found("record not found")));
+            return;
+          }
+      };
+     // Fetch first so a missing record surfaces as a 404: a bare filtered delete
+     // would silently remove zero rows and still report success.
+    let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
+    let mut db = state.db.clone();
+    if Record::get_by_id(&mut db, &record_id).await.is_err() {
+        res.status_code(StatusCode::NOT_FOUND);
+        res.render(Json(ApiProblem::not_found(&format!(
+               "record '{record_id}' not found",
+          ))));
+        return;
+     }
+    match toasty::query!(Record filter .id == #record_id)
+           .delete()
+           .exec(&mut db)
+           .await
+     {
+        Ok(()) => {
+            res.status_code(StatusCode::OK);
+            res.render(Json(ApiResponse::ok(())));
+         }
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(ApiProblem::server_error(&e.to_string())));
+         }
+     }
 }
 
 // ===========================================================================
@@ -1505,8 +1991,20 @@ pub fn create_router() -> Router {
                         ),
                 ),
         )
-        // Send email
-        .push(Router::with_path("mail").post(send_email))
+         // DNS record CRUD
+         .push(
+            Router::with_path("records")
+                 .get(list_records)
+                 .post(create_record)
+                 .push(
+                    Router::with_path("{record_id}")
+                         .get(get_record)
+                         .patch(patch_record)
+                         .delete(delete_record),
+                 ),
+          )
+         // Send email
+         .push(Router::with_path("mail").post(send_email))
         // Service control (optional SMTP / DNS listeners). The API and the
         // outbound worker are not controllable and have no route here.
         .push(
@@ -1743,6 +2241,123 @@ mod tests {
              .await;
         assert_eq!(res.status_code, Some(StatusCode::BAD_REQUEST));
       }
+
+      // --- DNS record CRUD ---------------------------------------------------
+
+      #[tokio::test]
+  async fn record_crud_roundtrip() {
+      let service = api_service().await;
+
+          // A domain must exist first: create_record validates the referent.
+      let res = TestClient::post("http://localhost/records")
+               .json(&serde_json::json!({
+                "domain_id": "example.com",
+                "record_type": "MX",
+                "value": "10 mail.example.com",
+                "ttl": 300,
+             }))
+               .send(&service)
+               .await;
+      assert_eq!(
+              res.status_code,
+              Some(StatusCode::BAD_REQUEST),
+           "record create must reject a not-yet-provisioned domain",
+          );
+
+      TestClient::post("http://localhost/domains")
+               .json(&serde_json::json!({ "id": "example.com" }))
+               .send(&service)
+               .await;
+
+          // Create: an omitted ttl falls back to the default; domain id is normalized.
+      let mut res = TestClient::post("http://localhost/records")
+               .json(&serde_json::json!({
+                "domain_id": "Example.COM",
+                "record_type": "MX",
+                "value": "10 mail.example.com",
+             }))
+               .send(&service)
+               .await;
+      assert_eq!(res.status_code, Some(StatusCode::OK));
+      let body: ApiResponse<RecordApiDTO> = res.take_json().await.expect("json body");
+      assert!(body.ok);
+      let created = body.data;
+      assert_eq!(created.domain_id, "example.com", "domain id is normalized to lowercase");
+      assert_eq!(created.record_type, "MX");
+      assert_eq!(created.value, "10 mail.example.com");
+      assert_eq!(created.ttl, DEFAULT_RECORD_TTL, "omitted ttl uses the default");
+      assert!(!created.created_at.is_empty());
+      assert!(!created.updated_at.is_empty());
+
+          // Fetch by numeric id.
+      let res =
+           TestClient::get(&format!("http://localhost/records/{id}", id = created.id)).send(&service).await;
+      assert_eq!(res.status_code, Some(StatusCode::OK));
+
+          // List, filtered by both domain and type.
+      let mut res = TestClient::get("http://localhost/records?domain_id=example.com&record_type=MX")
+               .send(&service)
+               .await;
+      assert_eq!(res.status_code, Some(StatusCode::OK));
+      let page: ApiResponse<Page<RecordApiDTO>> = res.take_json().await.expect("json body");
+      assert_eq!(page.data.items.len(), 1);
+      assert_eq!(page.data.items[0].id, created.id);
+
+          // A bad record type name 400s.
+      let res = TestClient::post("http://localhost/records")
+               .json(&serde_json::json!({
+                "domain_id": "example.com",
+                "record_type": "NOTATYPE",
+                "value": "x",
+             }))
+               .send(&service)
+               .await;
+      assert_eq!(res.status_code, Some(StatusCode::BAD_REQUEST));
+
+          // An empty value 400s.
+      let res = TestClient::post("http://localhost/records")
+               .json(&serde_json::json!({
+                "domain_id": "example.com",
+                "record_type": "TXT",
+                "value": "    ",
+             }))
+               .send(&service)
+               .await;
+      assert_eq!(res.status_code, Some(StatusCode::BAD_REQUEST));
+
+          // A duplicate (domain, type, value) triple 409s.
+      let res = TestClient::post("http://localhost/records")
+               .json(&serde_json::json!({
+                "domain_id": "example.com",
+                "record_type": "MX",
+                "value": "10 mail.example.com",
+             }))
+               .send(&service)
+               .await;
+      assert_eq!(res.status_code, Some(StatusCode::CONFLICT));
+
+          // Patch the value; the new triple must not collide with the self row.
+      let mut res = TestClient::patch(&format!("http://localhost/records/{id}", id = created.id))
+               .json(&serde_json::json!({ "value": "10 mx2.example.com" }))
+               .send(&service)
+               .await;
+      assert_eq!(res.status_code, Some(StatusCode::OK));
+      let body: ApiResponse<RecordApiDTO> = res.take_json().await.expect("json body");
+      assert_eq!(body.data.value, "10 mx2.example.com");
+
+          // Delete, then it is gone; a second delete 404s.
+      let res = TestClient::delete(&format!("http://localhost/records/{id}", id = created.id))
+               .send(&service)
+               .await;
+      assert_eq!(res.status_code, Some(StatusCode::OK));
+      let res =
+           TestClient::get(&format!("http://localhost/records/{id}", id = created.id)).send(&service).await;
+      assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
+      let res = TestClient::delete(&format!("http://localhost/records/{id}", id = created.id))
+               .send(&service)
+               .await;
+      assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
+       }
 
      // --- Send + messages ---------------------------------------------------
 
