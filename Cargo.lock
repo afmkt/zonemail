@@ -7834,7 +7834,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smtpd",
- "thiserror 2.0.20",
+ "thiserror 1.0.69",
  "toasty",
  "toasty-cli",
  "toasty-core",
