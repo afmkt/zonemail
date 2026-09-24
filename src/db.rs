@@ -522,3 +522,160 @@ pub struct DeliveryStatus {
     #[belongs_to(key = outbound_id, references = id )]
     pub outbound: Deferred<Outbound>,
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+//
+// Pure conversion tests for the DB layer's type-mapping logic — these exercise
+// the hickory record-type bridge, the `Domain`/`RecordDTO`/`Mailbox` constructors
+// without touching a real database.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_proto::rr::RecordType as HickoryRecordType;
+
+       #[test]
+    fn recordtype_roundtrips_through_hickory() {
+        for rt in [
+            RecordType::A,
+            RecordType::AAAA,
+            RecordType::CNAME,
+            RecordType::MX,
+            RecordType::NS,
+            RecordType::SOA,
+            RecordType::TXT,
+            RecordType::CAA,
+            RecordType::SRV,
+            RecordType::PTR,
+            RecordType::SVCB,
+            RecordType::HTTPS,
+        ] {
+             // Round-trip through hickory's enum and back yields the same type.
+            let hik: HickoryRecordType = rt.into();
+            let back: RecordType = hik.into();
+            assert_eq!(rt, back, "round-trip via hickory should preserve {rt:?}");
+         }
+       }
+
+       #[test]
+    fn recordtype_maps_unknown_codes_to_placeholder() {
+        // The hickory `Unknown(code)` collapses to our `Unknown`; the reverse
+        // maps `Unknown` back to `Unknown(0xFFFF)`.
+        let collapased = RecordType::from(HickoryRecordType::Unknown(0x1234));
+        assert!(matches!(collapased, RecordType::Unknown));
+
+        let back: HickoryRecordType = RecordType::Unknown.into();
+        assert_eq!(back, HickoryRecordType::Unknown(0xFFFF));
+
+           // CERT/SMIMEA/DNAME use their numeric codes on the way out.
+        assert_eq!(
+             HickoryRecordType::from(RecordType::CERT),
+             HickoryRecordType::Unknown(0x000A)
+        );
+        assert_eq!(
+             HickoryRecordType::from(RecordType::SMIMEA),
+             HickoryRecordType::Unknown(0x0041)
+        );
+        assert_eq!(
+             HickoryRecordType::from(RecordType::DNAME),
+             HickoryRecordType::Unknown(0x0027)
+        );
+       }
+
+       #[test]
+    fn domain_conversions_roundtrip() {
+        let domain = Domain::from("example.com");
+        assert_eq!(domain.id, "example.com");
+
+           // Domain -> String recovers the id.
+        let id: String = Domain::from("example.com").into();
+        assert_eq!(id, "example.com");
+
+           // &Domain -> String as well.
+        let id: String = (&domain).into();
+        assert_eq!(id, "example.com");
+
+           // From<&String> delegates to From<&str>.
+        let s = String::from("other.com");
+        let domain = Domain::from(&s);
+        assert_eq!(domain.id, "other.com");
+       }
+
+       #[test]
+    fn record_dto_maps_to_record_with_zeroed_id() {
+        let dto = RecordDTO {
+            domain_id: "example.com".to_string(),
+            record_type: RecordType::A,
+            value: "93.184.216.34".to_string(),
+            ttl: 3600,
+         };
+
+           // A DTO builds a Record with id 0 (auto-generated on insert) and the
+           // same scalar fields.
+        let record: Record = dto.clone().into();
+        assert_eq!(record.id, 0);
+        assert_eq!(record.domain_id, "example.com");
+        assert_eq!(record.record_type, RecordType::A);
+        assert_eq!(record.value, "93.184.216.34");
+        assert_eq!(record.ttl, 3600);
+
+           // A Record projects back to a DTO preserving the scalar fields.
+        let back: RecordDTO = (&record).into();
+        assert_eq!(back.domain_id, dto.domain_id);
+        assert_eq!(back.record_type, dto.record_type);
+        assert_eq!(back.value, dto.value);
+        assert_eq!(back.ttl, dto.ttl);
+       }
+
+       #[test]
+    fn record_dto_serde_roundtrips() {
+        let dto = RecordDTO {
+            domain_id: "example.com".to_string(),
+            record_type: RecordType::MX,
+            value: "mail.example.com".to_string(),
+            ttl: 60,
+         };
+        let json = serde_json::to_string(&dto).expect("serialize");
+        let back: RecordDTO =
+             serde_json::from_str(&json).expect("deserialize round-trips");
+        // `RecordDTO` has no `PartialEq`; compare the fields individually.
+        let orig = dto.clone();
+        assert_eq!(back.domain_id, orig.domain_id);
+        assert_eq!(back.record_type, orig.record_type);
+        assert_eq!(back.value, orig.value);
+        assert_eq!(back.ttl, orig.ttl);
+       }
+
+       #[test]
+    fn mailbox_try_from_splits_out_domain() {
+        let mailbox =
+             Mailbox::try_from("user@example.com".to_string()).expect("valid address");
+        assert_eq!(mailbox.id, "user@example.com");
+        assert_eq!(mailbox.domain_id, "example.com");
+        assert!(mailbox.forward_to.is_none());
+       }
+
+       #[test]
+    fn mailbox_try_from_rejects_missing_or_empty_domain() {
+         // A bare local-part with no domain is invalid.
+        assert!(matches!(
+             Mailbox::try_from("no-domain".to_string()),
+             Err(MailboxError::InvalidFormat)
+          ));
+         // An address ending at `@` has an empty domain part.
+        assert!(matches!(
+             Mailbox::try_from("user@".to_string()),
+             Err(MailboxError::InvalidFormat)
+          ));
+         }
+
+       #[test]
+    fn mailbox_try_from_takes_first_domain_part() {
+        // `a@b@c.com`: the domain is the first segment after the first `@`.
+        let mailbox =
+             Mailbox::try_from("a@b@c.com".to_string()).expect("parses");
+        assert_eq!(mailbox.domain_id, "b");
+        assert_eq!(mailbox.id, "a@b@c.com");
+       }
+}

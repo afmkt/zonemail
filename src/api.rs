@@ -784,7 +784,7 @@ pub struct SendEmail {
 
 /// Result of a successful send: the stored message id plus the enqueued delivery
 /// job ids (one [`Outbound`](crate::db::Outbound) queue entry per recipient).
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SendResult {
     pub message_id: u64,
     pub outbound_ids: Vec<u64>,
@@ -1378,4 +1378,355 @@ pub fn api_with_doc() -> Router {
         .push(doc.into_router("/doc/openapi.json"))
         .push(Scalar::new("/doc/openapi.json").into_router("/doc"))
         .push(api_router)
+}
+
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+//
+// The HTTP handlers are exercised through salvo's in-process `TestClient`, which
+// drives a real `Request` through the router and inspects the resulting
+// `Response` without opening a socket. Every test gets its own isolated in-memory
+// database via `AppState::connect_in_memory`, so suites are parallel-safe and
+// self-contained (no fixtures, no on-disk state).
+//
+// Request bodies are built with `serde_json::json!` because the request DTOs
+// (`NewDomain`, `NewMailbox`, `PatchMailbox`, `SendEmail`) are `Deserialize`-
+// only (inbound bodies are never serialized on our side), while the response DTOs
+// all derive `Deserialize`, letting tests deserialize `take_json` results.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use salvo::test::{ResponseExt, TestClient};
+
+    use crate::app::AppState;
+
+      /// A fresh API service backed by its own in-memory database, with the
+      /// `AppState` injected into the router's depot for every request. The state
+      /// is injected *by value* (not `Arc<..>`): the handlers call
+      /// `depot.get_typed_mut::<AppState>()`, and affix-state keys the depot by
+      /// the exact `TypeId` of the injected value, so the two must agree.
+    async fn api_service() -> salvo::Service {
+        let state = AppState::connect_in_memory().await.expect("in-memory state");
+        let router = create_router().hoop(salvo::affix_state::inject(state));
+        salvo::Service::new(router)
+      }
+
+     // --- Uniform API envelope ----------------------------------------------
+
+     #[test]
+    fn api_problem_constructions_carry_status_and_detail() {
+        let bad = ApiProblem::bad_request("nope");
+        assert_eq!(bad.status, 400);
+        assert_eq!(bad.r#type, "bad request");
+        assert_eq!(bad.detail.as_deref(), Some("nope"));
+
+        assert_eq!(ApiProblem::not_found("x").status, 404);
+        assert_eq!(ApiProblem::unauthorized().status, 401);
+        assert_eq!(ApiProblem::forbidden().status, 403);
+        assert_eq!(ApiProblem::conflict("x").status, 409);
+        assert_eq!(ApiProblem::server_error("x").status, 500);
+        assert_eq!(ApiProblem::validation_error("x").status, 422);
+
+          // `unauthorized`/`forbidden` carry no detail; the others do.
+        assert!(ApiProblem::unauthorized().detail.is_none());
+        assert!(ApiProblem::forbidden().detail.is_none());
+        assert!(ApiProblem::conflict("x").detail.is_some());
+      }
+
+      #[test]
+    fn api_response_ok_envelope() {
+        let resp = ApiResponse::ok(42);
+        assert!(resp.ok);
+        assert_eq!(resp.data, 42);
+      }
+
+      #[test]
+    fn page_from_all_slices_and_marks_more() {
+        let items: Vec<i32> = (1..=5).collect();
+
+          // Offset 1, limit 2 -> [2, 3]; end (3) < total (5) so `next_offset` set.
+        let page = Page::from_all(items.clone(), 2, 1);
+        assert_eq!(page.items, vec![2, 3]);
+        assert_eq!(page.limit, 2);
+        assert_eq!(page.offset, 1);
+        assert_eq!(page.next_offset, Some(3));
+
+          // A full page leaves no next offset.
+        let page = Page::from_all(items.clone(), 10, 0);
+        assert_eq!(page.items.len(), 5);
+        assert_eq!(page.next_offset, None);
+
+          // An offset past the end yields an empty page, not a panic.
+        let empty = Page::from_all(items, 10, 100);
+        assert!(empty.items.is_empty());
+      }
+
+     // --- Health ------------------------------------------------------------
+
+     #[tokio::test]
+    async fn health_probe_and_missing_route() {
+        let service = api_service().await;
+
+          // The health probe returns 200.
+        let res = TestClient::get("http://localhost/health").send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+
+          // An unregistered path surfaces as 404 (no root handler is mounted on
+          // this router), so the probe is not swallowed by a catch-all.
+        let res = TestClient::get("http://localhost/nope").send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
+      }
+
+     // --- Domain CRUD -------------------------------------------------------
+
+     #[tokio::test]
+    async fn domain_crud_roundtrip() {
+        let service = api_service().await;
+
+          // Create.
+        let mut res = TestClient::post("http://localhost/domains")
+             .json(&serde_json::json!({"id": "example.com"}))
+             .send(&service)
+             .await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+        let body: ApiResponse<DomainDTO> = res.take_json().await.expect("json body");
+        assert!(body.ok);
+        let created = body.data;
+        assert_eq!(created.id, "example.com");
+          // DB-stamped timestamps are present on the projected DTO.
+        assert!(!created.created_at.is_empty());
+        assert!(!created.updated_at.is_empty());
+
+          // Get the created domain.
+        let res = TestClient::get("http://localhost/domains/example.com").send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+
+          // A missing domain 404s.
+        let res = TestClient::get("http://localhost/domains/gone.example").send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
+
+          // Duplicate create 409s.
+        let res = TestClient::post("http://localhost/domains")
+             .json(&serde_json::json!({"id": "example.com"}))
+             .send(&service)
+             .await;
+        assert_eq!(res.status_code, Some(StatusCode::CONFLICT));
+
+          // Delete succeeds, then the domain is gone.
+        let res = TestClient::delete("http://localhost/domains/example.com").send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+        let res = TestClient::get("http://localhost/domains/example.com").send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
+          // Deleting an already-absent domain still 404s.
+        let res = TestClient::delete("http://localhost/domains/example.com").send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
+      }
+
+     // --- Mailbox CRUD ------------------------------------------------------
+
+     #[tokio::test]
+    async fn mailbox_crud_roundtrip_normalizes_case() {
+        let service = api_service().await;
+
+          // Create with mixed case; the stored id is normalized to lowercase.
+        let mut res = TestClient::post("http://localhost/mailboxes")
+             .json(&serde_json::json!({"id": "alice@example.com"}))
+             .send(&service)
+             .await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+        let body: ApiResponse<MailboxDTO> = res.take_json().await.expect("json body");
+        assert!(body.ok);
+        assert_eq!(body.data.id, "alice@example.com");
+
+          // Fetch by the normalized (lowercase) address.
+        let res = TestClient::get("http://localhost/mailboxes/alice@example.com").send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+
+          // A duplicate address 409s.
+        let res = TestClient::post("http://localhost/mailboxes")
+             .json(&serde_json::json!({"id": "alice@example.com"}))
+             .send(&service)
+             .await;
+        assert_eq!(res.status_code, Some(StatusCode::CONFLICT));
+
+          // Patch forward_to.
+        let res = TestClient::patch("http://localhost/mailboxes/alice@example.com")
+             .json(&serde_json::json!({"forward_to": "external@host.com"}))
+             .send(&service)
+             .await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+
+          // Delete, then it is gone.
+        let res = TestClient::delete("http://localhost/mailboxes/alice@example.com")
+             .send(&service)
+             .await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+        let res = TestClient::get("http://localhost/mailboxes/alice@example.com").send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
+      }
+
+      #[tokio::test]
+    async fn create_mailbox_rejects_address_without_domain() {
+        let service = api_service().await;
+        let res = TestClient::post("http://localhost/mailboxes")
+             .json(&serde_json::json!({"id": "no-domain-part"}))
+             .send(&service)
+             .await;
+        assert_eq!(res.status_code, Some(StatusCode::BAD_REQUEST));
+      }
+
+     // --- Send + messages ---------------------------------------------------
+
+      // A helper that provisions a sender mailbox so the send endpoints reach the
+      // code paths beyond the "sender must be provisioned" 409 gate.
+    async fn provision_sender(service: &salvo::Service, sender: &str) {
+        let res = TestClient::post("http://localhost/mailboxes")
+             .json(&serde_json::json!({"id": sender}))
+             .send(service)
+             .await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+      }
+
+      #[tokio::test]
+    async fn send_email_enqueues_one_job_per_recipient() {
+        let service = api_service().await;
+        provision_sender(&service, "sender@example.com").await;
+
+          // One Outbound job per distinct recipient (to + cc).
+        let mut res = TestClient::post("http://localhost/mail")
+             .json(&serde_json::json!({
+                   "from": "sender@example.com",
+                   "to": ["bob@ext.com"],
+                   "cc": ["carol@ext.com"],
+                   "subject": "Hi there",
+                   "body": "Hello world"
+               }))
+             .send(&service)
+             .await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+        let result: ApiResponse<SendResult> = res.take_json().await.expect("json body");
+        assert!(result.ok);
+        let data = result.data;
+        assert_eq!(data.outbound_ids.len(), 2, "one Outbound per recipient");
+
+          // The shared Message row is addressable by its id.
+        let mut res =
+            TestClient::get(&format!("http://localhost/messages/{}", data.message_id)).send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+        let msg: ApiResponse<MessageDTO> = res.take_json().await.expect("json body");
+        assert_eq!(msg.data.mail_from, "sender@example.com");
+      }
+
+      #[tokio::test]
+    async fn send_email_requires_a_provisioned_sender() {
+        let service = api_service().await;
+        // `ghost@example.com` was never provisioned, so the send is rejected even
+        // though the recipient is well-formed.
+        let res = TestClient::post("http://localhost/mail")
+             .json(&serde_json::json!({
+                   "from": "ghost@example.com",
+                   "to": ["bob@ext.com"],
+                   "body": "x"
+               }))
+             .send(&service)
+             .await;
+        assert_eq!(res.status_code, Some(StatusCode::CONFLICT));
+      }
+
+      #[tokio::test]
+    async fn send_email_rejects_missing_recipients() {
+        let service = api_service().await;
+        let res = TestClient::post("http://localhost/mail")
+             .json(&serde_json::json!({
+                   "from": "sender@example.com",
+                   "to": [],
+                   "body": "x"
+               }))
+             .send(&service)
+             .await;
+        assert_eq!(res.status_code, Some(StatusCode::BAD_REQUEST));
+      }
+
+      #[tokio::test]
+    async fn send_email_rejects_malformed_recipient() {
+        let service = api_service().await;
+          // Provision the sender so we reach recipient parsing, not the 409 gate.
+        provision_sender(&service, "sender@example.com").await;
+        let res = TestClient::post("http://localhost/mail")
+             .json(&serde_json::json!({
+                   "from": "sender@example.com",
+                   "to": ["not-an-email"],
+                   "body": "x"
+               }))
+             .send(&service)
+             .await;
+        assert_eq!(res.status_code, Some(StatusCode::BAD_REQUEST));
+      }
+
+     // --- Pagination --------------------------------------------------------
+
+     #[tokio::test]
+    async fn pagination_limit_query_param_is_honored() {
+        let service = api_service().await;
+          // `?limit=5` is reflected in the returned page envelope.
+        let mut res = TestClient::get("http://localhost/domains?limit=5").send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+        let page: ApiResponse<Page<DomainDTO>> = res.take_json().await.expect("json page");
+        assert_eq!(page.data.limit, 5);
+      }
+
+      #[tokio::test]
+    async fn pagination_limit_is_capped_at_max() {
+        let service = api_service().await;
+        let mut res =
+            TestClient::get(&format!("http://localhost/domains?limit={}", MAX_PAGE_LIMIT + 500))
+                  .send(&service)
+                  .await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+        let page: ApiResponse<Page<DomainDTO>> = res.take_json().await.expect("json page");
+        assert_eq!(page.data.limit, MAX_PAGE_LIMIT);
+      }
+
+
+       #[tokio::test]
+    async fn message_lifecycle_get_and_delete_by_id() {
+        let service = api_service().await;
+        provision_sender(&service, "sender@example.com").await;
+
+          // Send one message, capturing its stored id.
+        let mut res = TestClient::post("http://localhost/mail")
+              .json(&serde_json::json!({
+                    "from": "sender@example.com",
+                    "to": ["bob@ext.com"],
+                    "subject": "Lifecycle",
+                    "body": "hello"
+                 }))
+              .send(&service)
+              .await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+        let result: ApiResponse<SendResult> = res.take_json().await.expect("json body");
+        let message_id = result.data.message_id;
+
+          // Fetch the message by id.
+        let res =
+             TestClient::get(&format!("http://localhost/messages/{message_id}")).send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+
+          // An id that was never created 404s.
+        let res =
+             TestClient::get("http://localhost/messages/999999").send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
+
+          // Delete it.
+        let res =
+             TestClient::delete(&format!("http://localhost/messages/{message_id}")).send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+
+          // ...and now it is gone.
+        let res =
+             TestClient::get(&format!("http://localhost/messages/{message_id}")).send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
+       }
 }

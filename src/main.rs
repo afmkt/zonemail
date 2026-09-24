@@ -28,8 +28,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Database initialized and seeded successfully.");
 
     // 4. Set up Salvo Web & API Router
+    //
+    // The router must be injected with `AppState` **by value**: handlers retrieve
+    // it via `depot.get_typed_mut::<AppState>()`, and affix-state keys the depot by
+    // the exact `TypeId` of the injected value. Injecting `Arc<AppState>` instead
+    // would key it as `Arc<AppState>` and every handler's retrieval would fail with
+    // "AppState not found". We inject the original by value and let the background
+    // servers keep sharing a `Clone` of it through `shared_state`.
     let router = api_with_doc();
-    let router = router.hoop(salvo::affix_state::inject(shared_state.clone()));
+    let router = router.hoop(salvo::affix_state::inject(app_state));
 
     // 5. Build Server Address Bindings from Config
     let api_addr = cfg.api_addr()?;

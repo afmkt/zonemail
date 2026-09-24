@@ -55,7 +55,51 @@ impl AppState {
         ctx.seed_from_config(config).await?;
 
         Ok(ctx)
-    }
+      }
+
+      /// Open a database at `database_url` (a `turso:`/`libsql://` path or URL) and ensure the
+      /// application schema exists, returning a ready-to-use [`AppState`].
+      ///
+      /// Schema creation tolerates a "table already exists" error: `push_schema`
+      /// emits un-`IF NOT EXISTS` DDL, so re-running against a populated database
+      /// simply skips the already-created tables instead of failing.
+     pub async fn connect(database_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::from_driver(toasty_driver_turso::Turso::file(database_url).concurrent_writes()).await
+      }
+
+      /// Open a fresh, fully-isolated **in-memory** Turso database with the schema
+      /// applied. Intended for tests: `connect_in_memory` gives every test its own
+      /// database with no cross-test or on-disk state, so suites are parallel-
+      /// safe and self-contained (no fixtures, no cleanup, no leftover files).
+     pub async fn connect_in_memory() -> Result<Self, Box<dyn std::error::Error>> {
+        Self::from_driver(toasty_driver_turso::Turso::in_memory().concurrent_writes()).await
+      }
+
+      /// Build an [`AppState`] from an already-constructed driver, applying the
+      /// schema with the same "already exists" tolerance used by production
+      /// startup ([`AppState::connect`] / [`AppState::init`]).
+     async fn from_driver(
+         driver: toasty_driver_turso::Turso,
+      ) -> Result<Self, Box<dyn std::error::Error>> {
+        let db = toasty::Db::builder()
+        .models(toasty::models!(crate::*))
+        .build(driver)
+        .await?;
+
+        match db.push_schema().await {
+            Ok(()) => info!("Database schema synchronized successfully."),
+            Err(e) => {
+                let msg = format!("{e}");
+                if msg.contains("already exists") {
+                    info!("Database schema already up to date, skipping.");
+                } else {
+                    return Err(Box::new(e));
+                }
+            }
+        }
+
+        Ok(Self { db })
+      }
     async fn seed_from_config(
         &mut self,
         config: &Config,

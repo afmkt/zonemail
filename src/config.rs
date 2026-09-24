@@ -96,3 +96,110 @@ impl Config {
         format!("{}:{}", self.host, self.dns).parse()
     }
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+//
+// Pure tests for configuration parsing and the untagged `MailboxEntry` enum,
+// which is loaded verbatim from `zonemail.toml`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+         #[test]
+    fn mailbox_entry_simple_has_no_forward() {
+        let entry = MailboxEntry::Simple("user@example.com".to_string());
+        assert_eq!(entry.address(), "user@example.com");
+        assert_eq!(entry.forward_to(), None);
+        }
+
+         #[test]
+    fn mailbox_entry_detailed_carries_forward() {
+        let entry =
+             MailboxEntry::Detailed {
+                id: "user@example.com".to_string(),
+                forward_to: Some("user@gmail.com".to_string()),
+             };
+        assert_eq!(entry.address(), "user@example.com");
+        assert_eq!(entry.forward_to(), Some("user@gmail.com"));
+        }
+
+         #[test]
+    fn mailbox_entry_detailed_defaults_to_no_forward() {
+         // `forward_to` is `#[serde(default)]`, so a bare `id` deserializes to None.
+        let json = r#"{"id": "user@example.com"}"#;
+        let entry: MailboxEntry = serde_json::from_str(json).expect("deserialize");
+        match entry {
+            MailboxEntry::Detailed { forward_to, .. } => assert!(forward_to.is_none()),
+            MailboxEntry::Simple(_) => panic!("expected a Detailed entry"),
+            }
+        }
+
+         #[test]
+    fn mailbox_entry_untagged_json_picks_variant_by_shape() {
+         // A bare string is `Simple`; a table is `Detailed`.
+        let simple: Vec<MailboxEntry> =
+             serde_json::from_str(r#"[ "a@example.com" ]"#).expect("array");
+        assert!(matches!(simple[0], MailboxEntry::Simple(_)));
+        assert_eq!(simple[0].address(), "a@example.com");
+
+        let detailed: Vec<MailboxEntry> =
+             serde_json::from_str(r#"[ {"id": "b@example.com", "forward_to": "b@ext.com"} ]"#)
+                    .expect("array");
+        match &detailed[0] {
+            MailboxEntry::Detailed { id, forward_to } => {
+                assert_eq!(id.as_str(), "b@example.com");
+                assert_eq!(forward_to.as_deref(), Some("b@ext.com"));
+               }
+            MailboxEntry::Simple(_) => panic!("expected a Detailed entry"),
+            }
+        }
+
+         #[test]
+    fn config_default_ports_and_host() {
+        let cfg = Config::default();
+        assert_eq!(cfg.host, "0.0.0.0");
+        assert_eq!(cfg.dns, 53);
+        assert_eq!(cfg.smtp, 25);
+        assert_eq!(cfg.api, 8081);
+        assert_eq!(cfg.database_url, "turso:zonemail.db");
+        assert!(cfg.domains.is_empty());
+        assert!(cfg.records.is_empty());
+        assert!(cfg.mailboxes.is_empty());
+        }
+
+         #[test]
+    fn config_addr_helpers_join_host_and_port() {
+        let mut cfg = Config::default();
+        cfg.host = "127.0.0.1".to_string();
+        cfg.dns = 5353;
+        cfg.smtp = 1025;
+        cfg.api = 8080;
+        assert_eq!(cfg.dns_addr().unwrap(), "127.0.0.1:5353".parse().unwrap());
+        assert_eq!(cfg.smtp_addr().unwrap(), "127.0.0.1:1025".parse().unwrap());
+        assert_eq!(cfg.api_addr().unwrap(), "127.0.0.1:8080".parse().unwrap());
+        }
+
+         #[test]
+    fn config_addr_helpers_reject_bad_host() {
+        let mut cfg = Config::default();
+        cfg.host = "not a valid host".to_string();
+         // An invalid host makes the `SocketAddr` parse fail.
+        assert!(cfg.api_addr().is_err());
+        }
+
+         #[test]
+    fn config_deserializes_with_all_defaults() {
+          // An empty JSON object fills every field from `#[serde(default)]`.
+        let cfg: Config = serde_json::from_str("{}").expect("defaults");
+           // `Config` has no `PartialEq`; check the key fields instead.
+        assert_eq!(cfg.host, "0.0.0.0");
+        assert_eq!(cfg.dns, 53);
+        assert_eq!(cfg.smtp, 25);
+        assert_eq!(cfg.api, 8081);
+        assert!(cfg.domains.is_empty());
+        assert!(cfg.records.is_empty());
+        assert!(cfg.mailboxes.is_empty());
+        }
+}

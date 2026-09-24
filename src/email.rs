@@ -249,3 +249,116 @@ pub async fn run_mail_server(
     info!("Starting smtpd inbound mail server on {}", config.bind_addr);
     start_server(config, factory).await
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+//
+// The inbound handler reduces a raw SMTP payload to a set of fields through
+// `mail_parser`. These tests exercise that reduction directly — the pure
+// address helpers plus the header extraction the handler performs — using real
+// RFC-style payloads and hand-built `Address` values for the degenerate cases.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mail_parser::{Addr, Group, MimeHeaders};
+    use std::borrow::Cow;
+
+      /// A minimal but representative payload: From, To, Subject, Message-ID,
+      /// Content-Type, and a body.
+    fn sample_message() -> Vec<u8> {
+        b"Date: Mon, 1 Jan 2024 00:00:00 +0000\r\n\
+             From: Alice Smith <alice@example.com>\r\n\
+             To: Bob Jones <bob@ext.com>\r\n\
+             Subject: Hello world\r\n\
+             Message-ID: <1234@example.com>\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             \r\n\
+             A short body.\r\n"
+                 .to_vec()
+          }
+
+          #[test]
+    fn parse_extracts_from_subject_and_message_id() {
+        let raw = sample_message();
+        let msg = MessageParser::default().parse(&raw).expect("parses");
+
+             // Single-address `From:` collapses to the email, not the display name.
+        let from = msg.from().expect("From present");
+        assert_eq!(address_to_string(from), "alice@example.com");
+        assert_eq!(msg.subject().unwrap(), "Hello world");
+        assert_eq!(msg.message_id().unwrap(), "1234@example.com");
+          }
+
+          #[test]
+    fn parse_extracts_content_type() {
+        let raw = sample_message();
+        let msg = MessageParser::default().parse(&raw).expect("parses");
+        let ct = msg.content_type().expect("content-type parsed");
+             // `text/plain; charset=utf-8` -> type "text", subtype "plain".
+        assert_eq!(ct.c_type.as_ref(), "text");
+        assert_eq!(ct.c_subtype.as_deref(), Some("plain"));
+          }
+
+          #[test]
+    fn multiple_to_recipients_preserved_in_order() {
+        let raw = b"From: a@x.com\r\nTo: b@ext.com, Carol <c@ext.com>, d@ext.com\r\n\r\nbody\r\n"
+                 .to_vec();
+        let msg = MessageParser::default().parse(&raw).expect("parses");
+        let to = msg.to().expect("To present");
+        assert_eq!(
+             address_list_to_strings(to),
+             vec!["b@ext.com".to_string(), "c@ext.com".to_string(), "d@ext.com".to_string()],
+            );
+          }
+
+          #[test]
+    fn missing_subject_is_none() {
+        let raw = b"From: a@x.com\r\nTo: b@ext.com\r\n\r\nonly a body\r\n".to_vec();
+        let msg = MessageParser::default().parse(&raw).expect("parses");
+        assert!(msg.subject().is_none());
+          }
+
+          #[test]
+    fn address_to_string_is_empty_when_only_a_display_name() {
+             // A bare name with no `<addr>` yields no address (empty string).
+        let addr = Address::List(vec![Addr {
+             name: Some(Cow::Borrowed("Just a Name")),
+             address: None,
+            }]);
+        assert_eq!(address_to_string(&addr), "");
+        let strings = address_list_to_strings(&addr);
+        assert!(strings.is_empty());
+          }
+
+          #[test]
+    fn address_list_flattens_groups() {
+             // A group's members are flattened into the address list.
+        let addr = Address::Group(vec![Group {
+             name: Some(Cow::Borrowed("team")),
+             addresses: vec![
+                Addr {
+                   name: None,
+                   address: Some(Cow::Borrowed("m1@team.com")),
+                    },
+                Addr {
+                   name: None,
+                   address: Some(Cow::Borrowed("m2@team.com")),
+                    },
+                  ],
+            }]);
+        assert_eq!(
+             address_list_to_strings(&addr),
+             vec!["m1@team.com".to_string(), "m2@team.com".to_string()],
+            );
+             // The first address of the first group is the "single" representative.
+        assert_eq!(address_to_string(&addr), "m1@team.com");
+          }
+
+          #[test]
+    fn empty_list_yields_no_addresses() {
+        let addr = Address::List(Vec::new());
+        assert!(address_list_to_strings(&addr).is_empty());
+        assert_eq!(address_to_string(&addr), "");
+          }
+}

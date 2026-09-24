@@ -88,7 +88,21 @@ pub struct OutboundWorkerConfig {
     pub base_backoff: std::time::Duration,
     /// Upper bound on the retry backoff.
     pub max_backoff: std::time::Duration,
+           /// Port dialed on a recipient MX host (default 25; override for a relay/sink).
+      pub submission_port: u16,
 }
+
+impl OutboundWorkerConfig {
+        /// Override the outgoing SMTP port dialed on a recipient MX host.
+        /// A relay/Mailpit endpoint (e.g. 1025) lets outbound be redirected for
+        /// testing without touching the global default.
+      pub fn with_submission_port(mut self, port: u16) -> Self {
+            self.submission_port = port;
+            self
+            }
+           /// The outgoing SMTP port the worker dials on a recipient MX host.
+        pub fn submission_port(&self) -> u16 { self.submission_port }
+          }
 
 impl Default for OutboundWorkerConfig {
     fn default() -> Self {
@@ -97,6 +111,7 @@ impl Default for OutboundWorkerConfig {
             max_attempts: 8,
             base_backoff: std::time::Duration::from_secs(60),
             max_backoff: std::time::Duration::from_secs(3_600),
+                submission_port: SUBMISSION_PORT,
         }
     }
 }
@@ -387,34 +402,60 @@ async fn claim(
 // and only resolves the terminal / re-queued state below.
 async fn deliver_one(
     db: &mut toasty::Db,
-    mut outbound: Outbound,
+    outbound: Outbound,
     config: &OutboundWorkerConfig,
     now: Timestamp,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Load the message content to transmit, exactly as stored.
+       // Load the message content to transmit, exactly as stored.
     let message = Message::get_by_id(db, &outbound.message_id).await
-        .map_err(|e| err("failed to load Message for Outbound", e))?;
+            .map_err(|e| err("failed to load Message for Outbound", e))?;
 
-          // Build the envelope from the stored MAIL FROM and the job's RCPT TO.
+        // Build the envelope from the stored MAIL FROM and the job's RCPT TO.
     let envelope = build_envelope(&message.mail_from, &outbound.rcpt_to)?;
 
-    // Resolve MX hosts, highest priority first.
+        // Resolve MX hosts, highest priority first, then hand off to the transport core.
     let hosts = lookup_mx_hosts(&outbound.rcpt_to)
-        .await
-        .map_err(|e| err("failed to look up MX hosts", e))?;
+            .await
+            .map_err(|e| err("failed to look up MX hosts", e))?;
+    deliver_hosts(db, outbound, &message, &envelope, config, now, &hosts).await
+}
+
+/// Transport-level core of [`deliver_one`]: attempt delivery of one `Outbound`
+/// job to an explicit list of SMTP hosts (highest priority first). Each attempt
+/// appends a `DeliveryStatus` row; the first `250` resolves the job to
+/// `Delivered`, otherwise it finishes via [`fail_or_requeue`].
+///
+/// Split out from [`deliver_one`] so it can be exercised in isolation against a
+/// local in-process SMTP sink with **no** DNS resolution: pass `127.0.0.1` as the
+/// host and point [`OutboundWorkerConfig::with_submission_port`] at the sink. This
+/// keeps the SMTP handoff testable and free of external dependencies.
+///
+/// # Panics
+///
+/// None by design — every fallible step is returned as a boxed, `Send + Sync`
+/// error rather than unwrapping.
+pub async fn deliver_hosts(
+    db: &mut toasty::Db,
+    mut outbound: Outbound,
+    message: &Message,
+    envelope: &Envelope,
+    config: &OutboundWorkerConfig,
+    now: Timestamp,
+    hosts: &[String],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if hosts.is_empty() {
         warn!("No MX records for recipient of Outbound {}; requeueing for retry", outbound.id);
         return fail_or_requeue(db, &mut outbound, config, now, "no MX records for domain").await;
-    }
+        }
 
-    // Try each MX in priority order, recording one DeliveryStatus per attempt.
+        // Try each MX in priority order, recording one DeliveryStatus per attempt.
     let mut last_error: Option<String> = None;
     for host in hosts {
         info!("Outbound {} attempting MX {host}", outbound.id);
         let transport =
             AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host.clone())
-                .port(SUBMISSION_PORT)
-                .build();
+                     .port(config.submission_port())
+                     .build();
 
         match transport.send_raw(&envelope, &message.raw).await {
             Ok(response) => {
@@ -424,10 +465,10 @@ async fn deliver_one(
                     host.clone(),
                     Some(250),
                     Some(format!("{response:?}")),
-                )
-                .await?;
-                // Pre-compute the counter so the update does not read a field it
-                // is simultaneously mutating.
+                    )
+                    .await?;
+                    // Pre-compute the counter so the update does not read a field it
+                    // is simultaneously mutating.
                 let attempts = outbound.attempts + 1;
                 toasty::update! {
                     outbound {
@@ -435,36 +476,34 @@ async fn deliver_one(
                         attempts,
                         next_attempt_at: None,
                         last_error: None,
+                        }
                     }
-                }
-                .exec(db)
-                .await
-                .map_err(|e| err("failed to mark Outbound Delivered", e))?;
-                info!(
-                    "Delivered Outbound {} -> {} via {host}",
-                    outbound.id, outbound.rcpt_to
-                );
+                    .exec(db)
+                    .await
+                    .map_err(|e| err("failed to mark Outbound Delivered", e))?;
+                info!("Delivered Outbound {} -> {} via {host}", outbound.id, outbound.rcpt_to);
                 return Ok(());
-            }
+                 }
             Err(e) => {
                 warn!("Outbound {} failed via {host}: {e}", outbound.id);
                 record_delivery(db, outbound.id, host.clone(), None, Some(e.to_string()))
-                    .await?;
+                        .await?;
                 last_error = Some(format!("via {host}: {e}"));
-            }
+                 }
+             }
         }
-    }
 
-    // Every MX attempt failed: bump the counter and re-queue or fail terminally.
+        // Every MX attempt failed: bump the counter and re-queue or fail terminally.
     fail_or_requeue(
         db,
-        &mut outbound,
+            &mut outbound,
         config,
         now,
         last_error.as_deref().unwrap_or("all MX attempts failed"),
-    )
-    .await
+        )
+        .await
 }
+
 
 // Append a per-attempt audit row.
 async fn record_delivery(
@@ -600,4 +639,272 @@ async fn lookup_mx_hosts(
         }
     }
     Ok(hosts)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{split, AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+        // Write one CRLF-terminated reply through the connection's write half.
+        // `split()` gives independent read/write halves, so the sink can interleave
+        // reads and writes on one socket with no shared-mutable-borrow problem.
+    async fn write_resp(
+         w: &mut tokio::io::WriteHalf<tokio::net::TcpStream>,
+        bytes: &[u8],
+     ) {
+        let _ = w.write_all(bytes).await;
+        }
+
+        // A minimal submission-style SMTP sink: it accepts a connection, greets, and
+        // responds 250/354/221 so an outbound delivery attempt records a 250 without
+        // any external server or DNS. Returns the bound localhost port. A `BufReader`
+        // is required because this tokio build places `read_until` on `AsyncBufReadExt`.
+    async fn smtp_sink_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (sock, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                     };
+                tokio::spawn(handle_sink_session(sock));
+                 }
+             });
+        port
+         }
+
+        // Drive one accepted TCP connection to a successful `QUIT`-free acceptance.
+    async fn handle_sink_session(sock: tokio::net::TcpStream) {
+        let (rd, mut wr) = split(sock);
+        let mut reader = BufReader::new(rd);
+        let mut buf: Vec<u8> = Vec::new();
+            // The greeting precedes the client's first request.
+        write_resp(&mut wr, b"220 sink ESMTP\r\n").await;
+        loop {
+            let n = reader.read_until(b'\n', &mut buf).await;
+            match n {
+                Ok(0) => break, // client closed (EOF / QUIT without a final line)
+                Ok(_) => {}
+                Err(_) => break,
+                }
+            let cmd = String::from_utf8_lossy(&buf).trim_end().to_ascii_uppercase();
+            if cmd.starts_with("EHLO") || cmd.starts_with("HELO") {
+                write_resp(&mut wr, b"250 sink\r\n").await;
+                } else if cmd.starts_with("MAIL") {
+                write_resp(&mut wr, b"250 OK\r\n").await;
+                } else if cmd.starts_with("RCPT") {
+                write_resp(&mut wr, b"250 OK\r\n").await;
+                } else if cmd == "DATA" {
+                    // Admit the body, absorb it to the CRLF-`.` terminator, then
+                    // accept the message so the transport records a 250.
+                write_resp(&mut wr, b"354 Go ahead\r\n").await;
+                loop {
+                    let n = reader.read_until(b'\n', &mut buf).await;
+                    if n.unwrap_or(0) == 0 {
+                        break;
+                        }
+                    if String::from_utf8_lossy(&buf).trim_end() == "." {
+                        break;
+                        }
+                    }
+                write_resp(&mut wr, b"250 2.0.0 OK queued\r\n").await;
+                } else if cmd.starts_with("QUIT") {
+                write_resp(&mut wr, b"221 bye\r\n").await;
+                break;
+                } else {
+                    // RSET / NOOP / VRFY / ...: acknowledge so the client can continue.
+                write_resp(&mut wr, b"250 OK\r\n").await;
+                }
+            }
+        }
+
+        // Open a port, drop the listener, and return the now-free port so a client
+        // connection is refused — this drives the retry path without DNS.
+    async fn refused_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        port
+        }
+
+        // Reload a single `Outbound` row by id, asserting it still exists.
+    async fn load_outbound(db: &mut toasty::Db, id: u64) -> Outbound {
+        toasty::query!
+                (Outbound filter .id == #id).first().exec(db).await.unwrap().expect("outbound present")
+        }
+
+        // Create a fresh in-memory DB plus one stored `Message` and a Queued `Outbound`
+        // job for `sender` -> `recipient`. Returns (db, message_id, outbound_id). The
+        // message is built exactly as the API builds it, so the worker's stored form
+        // is identical to what `send_email` would produce.
+    async fn fresh_message_and_job(sender: &str, recipient: &str) -> (toasty::Db, u64, u64) {
+        let mut db = crate::app::AppState::connect_in_memory().await.unwrap().db;
+        let message = LettreMessage::builder()
+                .from(sender.parse().expect("from mailbox"))
+                .to(recipient.parse().expect("to mailbox"))
+                .subject("Hello".to_string())
+                .body("Hello, test world!\r\n".to_string())
+                .expect("build message");
+        let (mid, oid) =
+             enqueue_outbound(&mut db, sender, recipient, message).await.expect("enqueue_outbound");
+        (db, mid, oid)
+        }
+
+        // ----- pure logic -----
+
+        #[test]
+     fn backoff_delay_doubles_and_caps() {
+         let cfg = OutboundWorkerConfig::default(); // base 60s, cap 3600s
+         assert_eq!(backoff_delay(&cfg, 1).as_secs(), 60);
+         assert_eq!(backoff_delay(&cfg, 2).as_secs(), 120);
+         assert_eq!(backoff_delay(&cfg, 4).as_secs(), 480);
+         assert_eq!(backoff_delay(&cfg, 64).as_secs(), 3600); // clamped to cap
+        }
+
+        #[test]
+     fn submission_port_defaults_to_25_and_is_overridable() {
+         assert_eq!(OutboundWorkerConfig::default().submission_port(), 25);
+         assert_eq!(
+             OutboundWorkerConfig::default().with_submission_port(1025).submission_port(),
+              1025
+            );
+        }
+
+        // ----- queue state machine -----
+
+        #[tokio::test]
+     async fn fail_or_requeue_requeues_before_cap() {
+          let (mut db, _mid, oid) =
+              fresh_message_and_job("alice@example.com", "bob@other.example").await;
+          let mut job = load_outbound(&mut db, oid).await;
+          fail_or_requeue(
+                   &mut db,
+                   &mut job,
+                   &OutboundWorkerConfig::default(),
+              jiff::Timestamp::now(),
+                   "transient",
+             )
+             .await
+             .unwrap();
+          let reread = load_outbound(&mut db, oid).await;
+          assert_eq!(reread.status, OutboundStatus::Queued, "retried, still Queued");
+          assert_eq!(reread.attempts, 1, "one attempt recorded");
+          assert!(reread.next_attempt_at.is_some(), "backoff scheduled");
+          assert_eq!(reread.last_error.as_deref(), Some("transient"));
+        }
+
+        #[tokio::test]
+     async fn fail_or_requeue_marks_failed_at_cap() {
+          let (mut db, _mid, oid) = fresh_message_and_job("a@x.example", "b@y.example").await;
+          let cap = OutboundWorkerConfig::default().max_attempts;
+          let mut job = load_outbound(&mut db, oid).await;
+          job.attempts = cap; // simulate having exhausted the attempt cap
+          fail_or_requeue(
+                   &mut db,
+                   &mut job,
+                   &OutboundWorkerConfig::default(),
+              jiff::Timestamp::now(),
+                   "exhausted",
+             )
+             .await
+             .unwrap();
+          let reread = load_outbound(&mut db, oid).await;
+          assert_eq!(reread.status, OutboundStatus::Failed, "terminal past the cap");
+          assert!(reread.next_attempt_at.is_none(), "no further attempts scheduled");
+        }
+
+        #[tokio::test]
+     async fn reclaim_in_progress_requeues_stale_jobs() {
+          let mut db = crate::app::AppState::connect_in_memory().await.unwrap().db;
+          let job = toasty::create! {
+              Outbound {
+                  message_id: 0,
+                  rcpt_to: "stale@x.example".to_string(),
+                  sender_id: "s@x.example".to_string(),
+                  status: OutboundStatus::InProgress,
+                  attempts: 0,
+                  next_attempt_at: None,
+                  last_error: Some("crash".to_string()),
+                   }
+               }
+               .exec(&mut db)
+               .await
+               .unwrap();
+          let oid = job.id;
+          reclaim_in_progress(&mut db).await;
+          let reread = load_outbound(&mut db, oid).await;
+          assert_eq!(reread.status, OutboundStatus::Queued, "stale job reclaimed");
+          assert!(reread.next_attempt_at.is_none());
+        }
+
+        // ----- the actual SMTP handoff, against the local sink -----
+
+        #[tokio::test]
+     async fn deliver_hosts_delivers_to_local_sink() {
+          let (mut db, mid, oid) =
+              fresh_message_and_job("alice@example.com", "bob@other.example").await;
+          let outbound = load_outbound(&mut db, oid).await;
+          let stored = Message::get_by_id(&mut db, &mid).await.expect("stored message present");
+          let envelope =
+              build_envelope(&stored.mail_from, &outbound.rcpt_to).expect("build envelope");
+          let port = smtp_sink_port().await;
+          let cfg = OutboundWorkerConfig::default().with_submission_port(port);
+          deliver_hosts(
+                   &mut db,
+              outbound,
+                   &stored,
+                   &envelope,
+                   &cfg,
+              jiff::Timestamp::now(),
+                   &["127.0.0.1".to_string()],
+             )
+             .await
+             .expect("deliver to sink");
+          let job = load_outbound(&mut db, oid).await;
+          assert_eq!(job.status, OutboundStatus::Delivered, "job Delivered via sink");
+          assert_eq!(job.attempts, 1, "one successful attempt");
+          let statuses =
+              toasty::query!(DeliveryStatus filter .outbound_id == #oid)
+                   .exec(&mut db)
+                   .await
+                   .unwrap();
+          assert_eq!(statuses.len(), 1, "one DeliveryStatus row per attempt");
+          assert_eq!(statuses[0].code, Some(250), "recorded a 250 success code");
+        }
+
+        #[tokio::test]
+     async fn deliver_hosts_requeues_when_port_refused() {
+          let (mut db, mid, oid) =
+              fresh_message_and_job("alice@example.com", "bob@no.example").await;
+          let outbound = load_outbound(&mut db, oid).await;
+          let stored =
+              Message::get_by_id(&mut db, &mid).await.expect("stored message present");
+          let envelope =
+              build_envelope(&stored.mail_from, &outbound.rcpt_to).expect("build envelope");
+          let port = refused_port().await;
+          let cfg = OutboundWorkerConfig::default().with_submission_port(port);
+              // A refused connection is a failed attempt -> re-queue, never a panic.
+          deliver_hosts(
+                   &mut db,
+              outbound,
+                   &stored,
+                   &envelope,
+                   &cfg,
+              jiff::Timestamp::now(),
+                   &["127.0.0.1".to_string()],
+             )
+             .await
+             .expect("re-queue on refusal");
+          let job = load_outbound(&mut db, oid).await;
+          assert_eq!(job.status, OutboundStatus::Queued, "refused delivery is retried");
+          assert_eq!(job.attempts, 1, "one attempted delivery before re-queue");
+          assert!(job.next_attempt_at.is_some(), "backoff scheduled for the retry");
+          assert!(job.last_error.is_some(), "failure reason recorded");
+        }
 }

@@ -10,11 +10,15 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-   # No debug info in CI: a full-debuginfo build of this (openssl + turso +
-   # salvo) tree is large; skip it to stay within the GitHub runner disk cap.
+    # No debug info in CI: a full-debuginfo build of this (openssl + turso +
+    # salvo) tree is large; skip it to stay within the GitHub runner disk cap.
   CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
+   # ═══ Build + Lint ═══
+   #
+   # fmt and clippy are advisory (continue-on-error) while an existing
+   # format/clippy backlog is worked down; the release build is the hard gate.
   build-and-lint:
     name: Build + Clippy + fmt
     runs-on: ubuntu-latest
@@ -34,11 +38,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev
 
-      # NOTE: fmt and clippy are non-blocking (continue-on-error) while an
-      # existing format/clippy backlog is worked down. The release build and
-      # cargo audit below are the hard gates. Tighten by dropping
-      # `continue-on-error: true` once `cargo fmt` and `cargo clippy --all
-      # --all-features -D warnings` are both clean.
+        # NOTE: fmt and clippy are non-blocking (continue-on-error) while an
+        # existing format/clippy backlog is worked down. The release build and
+        # cargo audit are the hard gates. Tighten by dropping
+        # `continue-on-error: true` once both are clean.
       - name: Check formatting (advisory)
         continue-on-error: true
         run: cargo fmt -- --check
@@ -58,7 +61,42 @@ jobs:
           echo "- Checks: fmt, clippy (-D warnings), release build" >> $GITHUB_STEP_SUMMARY
           echo "- Platform: Ubuntu LTS (GitHub Actions)" >> $GITHUB_STEP_SUMMARY
 
-  # ═══════════════ SECURITY AUDIT ═══════════════
+   # ═══ Tests ═══
+   #
+   # In-process suites backed by an in-memory Turso database and an in-loop
+   # local TCP sink for the outbound delivery worker. No external services are
+   # required and each test is parallel-safe, so this is a hard gate.
+  tests:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies (openssl, pkg-config)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Run test suite
+        run: cargo test --all-targets
+
+      - name: Test report summary
+        if: always()
+        run: |
+          echo "### Test Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Status: ${{ job.status == 'success' && '✅ Passed' || '❌ Failed' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Suites: lib unit + integration tests (in-memory Turso DB)" >> $GITHUB_STEP_SUMMARY
+          echo "- Platform: Ubuntu LTS (GitHub Actions)" >> $GITHUB_STEP_SUMMARY
+
+   # ═══ Security Audit ═══
    #
    # Cargo.lock is committed; cargo-audit checks it against the RustSec
    # advisory database. Any advisory fails the build until it is fixed at the
