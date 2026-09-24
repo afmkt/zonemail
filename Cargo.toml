@@ -2,6 +2,14 @@
 name = "zonemail"
 version = "0.1.0"
 edition = "2024"
+description = "Lightweight self-contained email + DNS service: REST API, authoritative DNS, inbound SMTP, and outbound delivery in one Rust binary/lib"
+license = "Apache-2.0"
+license-file = "LICENSE"
+readme = "README.md"
+repository = "https://github.com/afmkt/zonemail"
+homepage = "https://github.com/afmkt/zonemail"
+keywords = ["email", "smtp", "dns", "mailcatcher", "forwarder"]
+categories = ["networking", "networking::server"]
 
 [dependencies]
 salvo = { version = "*", features = [
