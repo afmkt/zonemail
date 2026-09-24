@@ -16,6 +16,9 @@
 //! * **Mailbox (email address)** — `GET/POST /mailboxes`,
 //!   `GET/PATCH/DELETE /mailboxes/{mailbox_id}`
 //! * **Send email** — `POST /mail`
+//! * **Service control** — `GET /services`,
+//!   `POST /services/{service}/start`, `POST /services/{service}/stop`,
+//!   `POST /services/mode`
 //! * **Messages of an email address (send or receive)** —
 //!   `GET /mailboxes/{mailbox_id}/messages`,
 //!   `GET /mailboxes/{mailbox_id}/messages/inbox`,
@@ -27,10 +30,12 @@
 //! failure and [`ApiResponse`] on success.
 use salvo::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use crate::app::AppState;
 use crate::db::{Domain, Inbound, Mailbox, MailboxError, Message, Outbound};
 use crate::send::{enqueue_forward, enqueue_outbound};
+use crate::services::{BootMode, Service, ServiceManager, ServiceReport, ServiceResult};
 use lettre::message::{header::ContentType, Mailbox as LettreMailbox, Message as LettreMessage};
 
 // ===========================================================================
@@ -1313,6 +1318,155 @@ pub struct HealthInfo {
 }
 
 // ===========================================================================
+// Services (optional SMTP / DNS listener control)
+//
+// The API and the outbound worker are always on and not controllable. Only the
+// SMTP and DNS listeners are; they are owned by the injected `ServiceManager`
+// (a second depot value, retrieved as `Arc<ServiceManager>` — not the by-value
+// `AppState`). Start/stop are idempotent: a command that is already satisfied
+// reports `changed: false` rather than erroring.
+// ===========================================================================
+
+/// Body for switching the optional servers between boot modes.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetModeBody {
+        /// `full` (SMTP+DNS, the default), `smtp`, `dns`, or `api-only`.
+    pub mode: BootMode,
+}
+
+/// Pull the injected `ServiceManager` out of the depot, or fail the request with
+/// a 500. The manager is a process-global `Arc` control plane, so a clone reaches
+/// the same underlying state as `main`.
+fn extract_manager(depot: &mut Depot, res: &mut Response) -> Option<Arc<ServiceManager>> {
+    match depot.get_typed_mut::<Arc<ServiceManager>>() {
+         Ok(mgr) => Some((*mgr).clone()),
+         Err(_e) => {
+             res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+             res.render(Json(ApiProblem::server_error(
+                  "service manager not injected",
+              )));
+             None
+            }
+          }
+        }
+
+#[endpoint(
+     summary = "List controllable services and their status",
+     responses(
+           (status_code = 200, description = "Service status", body = ApiResponse<Vec<ServiceReport>>),
+           (status_code = 500, description = "Server error", body = ApiProblem)
+        )
+)]
+async fn list_services(depot: &mut Depot, res: &mut Response) {
+    let mgr = match extract_manager(depot, res) {
+         Some(mgr) => mgr,
+         None => return,
+          };
+    res.status_code(StatusCode::OK);
+    res.render(Json(ApiResponse::ok(mgr.list())));
+ }
+
+#[endpoint(
+     summary = "Start a controllable service (idempotent)",
+     responses(
+           (status_code = 200, description = "Service start result", body = ApiResponse<ServiceResult>),
+           (status_code = 400, description = "Unknown service", body = ApiProblem),
+           (status_code = 500, description = "Server error / bind failure", body = ApiProblem)
+        )
+)]
+async fn start_service(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let mgr = match extract_manager(depot, res) {
+         Some(mgr) => mgr,
+         None => return,
+          };
+    let service_name = req.param::<String>("service").unwrap_or_default();
+    let svc = match Service::parse(&service_name) {
+         Some(svc) => svc,
+         None => {
+             res.status_code(StatusCode::BAD_REQUEST);
+             res.render(Json(ApiProblem::bad_request(
+                  &format!("unknown service '{service_name}'; expected 'dns' or 'smtp'"),
+              )));
+             return;
+            }
+          };
+    match mgr.start(svc) {
+         Ok(result) => {
+             res.status_code(StatusCode::OK);
+             res.render(Json(ApiResponse::ok(result)));
+            }
+         Err(e) => {
+             res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+             res.render(Json(ApiProblem::server_error(&format!("failed to start {:?}: {e}", svc))));
+            }
+          }
+ }
+
+#[endpoint(
+     summary = "Stop a controllable service (idempotent)",
+     responses(
+           (status_code = 200, description = "Service stop result", body = ApiResponse<ServiceResult>),
+           (status_code = 400, description = "Unknown service", body = ApiProblem),
+           (status_code = 500, description = "Server error", body = ApiProblem)
+        )
+)]
+async fn stop_service(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let mgr = match extract_manager(depot, res) {
+         Some(mgr) => mgr,
+         None => return,
+          };
+    let service_name = req.param::<String>("service").unwrap_or_default();
+    let svc = match Service::parse(&service_name) {
+         Some(svc) => svc,
+         None => {
+             res.status_code(StatusCode::BAD_REQUEST);
+             res.render(Json(ApiProblem::bad_request(
+                  &format!("unknown service '{service_name}'; expected 'dns' or 'smtp'"),
+              )));
+             return;
+            }
+          };
+    match mgr.stop(svc) {
+         Ok(result) => {
+             res.status_code(StatusCode::OK);
+             res.render(Json(ApiResponse::ok(result)));
+            }
+         Err(e) => {
+             res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+             res.render(Json(ApiProblem::server_error(&format!("failed to stop {:?}: {e}", svc))));
+            }
+          }
+ }
+
+#[endpoint(
+     summary = "Switch the optional services to a named mode",
+     request_body = SetModeBody,
+     responses(
+           (status_code = 200, description = "Resulting service statuses", body = ApiResponse<Vec<ServiceReport>>),
+           (status_code = 400, description = "Bad request / unknown mode", body = ApiProblem),
+           (status_code = 500, description = "Server error", body = ApiProblem)
+        )
+)]
+async fn set_mode(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let mgr = match extract_manager(depot, res) {
+         Some(mgr) => mgr,
+         None => return,
+          };
+    let body = match req.parse_json::<SetModeBody>().await {
+         Ok(body) => body,
+         Err(_e) => {
+             res.status_code(StatusCode::BAD_REQUEST);
+             res.render(Json(ApiProblem::bad_request(
+                  "invalid mode; expected one of full|smtp|dns|api-only",
+              )));
+             return;
+            }
+          };
+    res.status_code(StatusCode::OK);
+    res.render(Json(ApiResponse::ok(mgr.apply_mode(body.mode))));
+ }
+
+// ===========================================================================
 // Router assembly
 // ===========================================================================
 
@@ -1353,6 +1507,18 @@ pub fn create_router() -> Router {
         )
         // Send email
         .push(Router::with_path("mail").post(send_email))
+        // Service control (optional SMTP / DNS listeners). The API and the
+        // outbound worker are not controllable and have no route here.
+        .push(
+             Router::with_path("services")
+                   .get(list_services)
+                   .push(Router::with_path("mode").post(set_mode))
+                   .push(
+             Router::with_path("{service}")
+                          .push(Router::with_path("start").post(start_service))
+                          .push(Router::with_path("stop").post(stop_service)),
+                   ),
+        )
         // Message CRUD (by id, resource-agnostic)
         .push(
             Router::with_path("messages").push(
@@ -1401,6 +1567,7 @@ mod tests {
     use salvo::test::{ResponseExt, TestClient};
 
     use crate::app::AppState;
+    use crate::services::Status;
 
       /// A fresh API service backed by its own in-memory database, with the
       /// `AppState` injected into the router's depot for every request. The state
@@ -1729,4 +1896,102 @@ mod tests {
              TestClient::get(&format!("http://localhost/messages/{message_id}")).send(&service).await;
         assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
        }
+
+         // --- Service control -------------------------------------------------
+        /// like [`api_service`], but also injects a test `ServiceManager` that
+        /// never binds a real port (`ServiceManager::for_test`), so the control
+        /// routes can be exercised without opening :25/:53.
+    async fn service_api_service() -> salvo::Service {
+        use crate::services::ServiceManager;
+        let mgr = std::sync::Arc::new(ServiceManager::for_test());
+        let state = AppState::connect_in_memory().await.expect("in-memory state");
+        let router = (create_router())
+                  .hoop(salvo::affix_state::inject(state))
+                  .hoop(salvo::affix_state::inject(mgr));
+        salvo::Service::new(router)
+          }
+
+         #[tokio::test]
+    async fn service_list_defaults_to_idle() {
+        let service = service_api_service().await;
+        let mut res = TestClient::get("http://localhost/services").send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+        let body: ApiResponse<Vec<ServiceReport>> = res.take_json().await.expect("json body");
+        assert!(body.ok);
+        assert_eq!(body.data.len(), 2);
+        for r in &body.data {
+            assert_eq!(r.status, Status::Idle);
+            assert!(r.service == Service::Dns || r.service == Service::Smtp);
+              }
+            }
+
+        #[tokio::test]
+    async fn service_start_stop_is_idempotent() {
+        let service = service_api_service().await;
+
+              // Start is a real change the first time, a no-op the second.
+        let mut res = TestClient::post("http://localhost/services/smtp/start").send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+        let r: ApiResponse<ServiceResult> = res.take_json().await.expect("json body");
+        assert!(r.data.changed);
+        assert_eq!(r.data.status, Status::Running);
+
+        let mut res = TestClient::post("http://localhost/services/smtp/start").send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+        let r: ApiResponse<ServiceResult> = res.take_json().await.expect("json body");
+        assert!(!r.data.changed);
+
+              // A non-controllable service name 400s (the API worker has no route).
+        let res = TestClient::post("http://localhost/services/api/start").send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::BAD_REQUEST));
+
+              // Stop is a real change once; a second stop is a no-op.
+        let mut res = TestClient::post("http://localhost/services/smtp/stop").send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+        let r: ApiResponse<ServiceResult> = res.take_json().await.expect("json body");
+        assert!(r.data.changed);
+        assert_eq!(r.data.status, Status::Idle);
+
+        let mut res = TestClient::post("http://localhost/services/smtp/stop").send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+        let r: ApiResponse<ServiceResult> = res.take_json().await.expect("json body");
+        assert!(!r.data.changed);
+            }
+
+        #[tokio::test]
+    async fn service_mode_switches_all_services() {
+        let service = service_api_service().await;
+
+              // Switch to DNS-only, leaving SMTP stopped.
+        let mut res =
+             TestClient::post("http://localhost/services/mode")
+                            .json(&serde_json::json!({ "mode": "dns" }))
+                            .send(&service)
+                            .await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+        let body: ApiResponse<Vec<ServiceReport>> = res.take_json().await.expect("json body");
+        let dns = body.data.iter().find(|r| r.service == Service::Dns).unwrap();
+        let smtp = body.data.iter().find(|r| r.service == Service::Smtp).unwrap();
+        assert_eq!(dns.status, Status::Running);
+        assert_eq!(smtp.status, Status::Idle);
+
+              // A full-mode switch brings both up.
+        let mut res =
+             TestClient::post("http://localhost/services/mode")
+                            .json(&serde_json::json!({ "mode": "full" }))
+                            .send(&service)
+                            .await;
+        assert_eq!(res.status_code, Some(StatusCode::OK));
+        let body: ApiResponse<Vec<ServiceReport>> = res.take_json().await.expect("json body");
+        assert_eq!(body.data.len(), 2);
+        assert!(body.data.iter().all(|r| r.status == Status::Running));
+
+              // An unknown mode 400s.
+        let res =
+             TestClient::post("http://localhost/services/mode")
+                            .json(&serde_json::json!({ "mode": "banana" }))
+                            .send(&service)
+                            .await;
+        assert_eq!(res.status_code, Some(StatusCode::BAD_REQUEST));
+            }
 }

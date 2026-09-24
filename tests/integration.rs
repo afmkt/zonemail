@@ -16,6 +16,7 @@ use salvo::test::{ResponseExt, TestClient};
 
 use zonemail::api::{ApiResponse, create_router, MessageDTO, SendResult};
 use zonemail::app::AppState;
+use zonemail::services::{Service, ServiceManager, Status};
 
 /// A freshly-built API service, each with its own in-memory database.
 async fn api_service() -> salvo::Service {
@@ -149,4 +150,138 @@ async fn health_probe_and_unmatched_route() {
        // catch-all that swallows unmatched routes.
      let res = TestClient::get("http://localhost/does-not-exist").send(&service).await;
      assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND), "404 for unknown route");
+}
+
+// ---------------------------------------------------------------------------
+// Service control (`/services/...`). These drive the real router with a
+// `ServiceManager` built from `for_test()` — a spawner that never opens a real
+// port — so the lifecycle endpoints are exercised end-to-end without needing
+// root for :25/:53.
+//
+// Note the second injected state: the control handlers retrieve `Arc<ServiceManager>`
+// by *reference*, so `get_typed_mut::<Arc<_>>` yields it as-is and the handler clones
+// out the cheap `Arc`. Both `AppState` and `Arc<ServiceManager>` live in one depot
+// (keyed by `TypeId`) exactly as production wires them in `main`.
+
+/// An API service that also carries a test `ServiceManager` (no real sockets)
+/// alongside the usual in-memory `AppState`.
+async fn service_api_service() -> salvo::Service {
+     let mgr = std::sync::Arc::new(ServiceManager::for_test());
+     let state = AppState::connect_in_memory().await.expect("in-memory state");
+     let router = create_router()
+        .hoop(affix_state::inject(state))
+        .hoop(affix_state::inject(mgr));
+     salvo::Service::new(router)
+}
+
+    #[tokio::test]
+async fn services_list_reports_both_listeners_idle_by_default() {
+     let service = service_api_service().await;
+
+     let mut res = TestClient::get("http://localhost/services").send(&service).await;
+     assert_eq!(res.status_code, Some(StatusCode::OK), "list");
+     let body: ApiResponse<Vec<zonemail::services::ServiceReport>> =
+        res.take_json().await.expect("json body");
+     assert!(body.ok, "list ok");
+     assert_eq!(body.data.len(), 2, "one report per controllable service");
+     assert!(body.data.iter().all(|r| r.status == Status::Idle), "both idle at boot");
+     let has_dns = body.data.iter().any(|r| r.service == Service::Dns);
+     let has_smtp = body.data.iter().any(|r| r.service == Service::Smtp);
+     assert!(has_dns, "a report for dns");
+     assert!(has_smtp, "a report for smtp");
+}
+
+    #[tokio::test]
+async fn service_start_stop_is_idempotent_through_router() {
+     let service = service_api_service().await;
+
+        // First start is a real change.
+     let mut res = TestClient::post("http://localhost/services/smtp/start").send(&service).await;
+     assert_eq!(res.status_code, Some(StatusCode::OK), "start");
+     let r: ApiResponse<zonemail::services::ServiceResult> =
+        res.take_json().await.expect("json body");
+     assert!(r.data.changed, "first start");
+     assert_eq!(r.data.status, Status::Running);
+     assert_eq!(r.data.service, Service::Smtp);
+
+        // The second start is a no-op.
+     let mut res = TestClient::post("http://localhost/services/smtp/start").send(&service).await;
+     assert_eq!(res.status_code, Some(StatusCode::OK), "start again");
+     let r: ApiResponse<zonemail::services::ServiceResult> =
+        res.take_json().await.expect("json body");
+     assert!(!r.data.changed, "idempotent start");
+
+        // Stopping is a real change, then a no-op.
+     let mut res = TestClient::post("http://localhost/services/smtp/stop").send(&service).await;
+     assert_eq!(res.status_code, Some(StatusCode::OK), "stop");
+     let r: ApiResponse<zonemail::services::ServiceResult> =
+        res.take_json().await.expect("json body");
+     assert!(r.data.changed, "first stop");
+     assert_eq!(r.data.status, Status::Idle);
+
+     let mut res = TestClient::post("http://localhost/services/smtp/stop").send(&service).await;
+     assert_eq!(res.status_code, Some(StatusCode::OK), "stop again");
+     let r: ApiResponse<zonemail::services::ServiceResult> =
+        res.take_json().await.expect("json body");
+     assert!(!r.data.changed, "idempotent stop");
+}
+
+    #[tokio::test]
+async fn service_mode_switches_all_listeners() {
+     let service = service_api_service().await;
+
+        // DNS-only shuts anything else down; here SMTP must be Idle and DNS Running.
+     let mut res =
+        TestClient::post("http://localhost/services/mode")
+          .json(&serde_json::json!({ "mode": "dns" }))
+          .send(&service)
+          .await;
+     assert_eq!(res.status_code, Some(StatusCode::OK), "set mode");
+     let body: ApiResponse<Vec<zonemail::services::ServiceReport>> =
+        res.take_json().await.expect("json body");
+     let dns = body.data.iter().find(|r| r.service == Service::Dns).unwrap();
+     let smtp = body.data.iter().find(|r| r.service == Service::Smtp).unwrap();
+     assert_eq!(dns.status, Status::Running, "dns up for dns-mode");
+     assert_eq!(smtp.status, Status::Idle, "smtp down for dns-mode");
+
+        // Full brings both up.
+     let mut res =
+        TestClient::post("http://localhost/services/mode")
+          .json(&serde_json::json!({ "mode": "full" }))
+          .send(&service)
+          .await;
+     assert_eq!(res.status_code, Some(StatusCode::OK), "set full mode");
+     let body: ApiResponse<Vec<zonemail::services::ServiceReport>> =
+        res.take_json().await.expect("json body");
+     assert!(
+        !body.data.is_empty() && body.data.iter().all(|r| r.status == Status::Running),
+        "both running after full mode"
+     );
+
+        // An unknown mode is a client error.
+     let res =
+        TestClient::post("http://localhost/services/mode")
+          .json(&serde_json::json!({ "mode": "banana" }))
+          .send(&service)
+          .await;
+     assert_eq!(res.status_code, Some(StatusCode::BAD_REQUEST), "unknown mode");
+}
+
+    #[tokio::test]
+async fn service_control_rejects_non_controllable_names() {
+     let service = service_api_service().await;
+
+        // The API worker and outbound consumer are always-on and have no control
+        // route: a lifecycle path for them 400s instead of silently no-oping.
+     for name in ["api", "outbound"] {
+        let res =
+             TestClient::post(format!("http://localhost/services/{name}/start"))
+               .send(&service)
+               .await;
+        assert_eq!(
+             res.status_code,
+             Some(StatusCode::BAD_REQUEST),
+             "{name} is not controllable"
+        );
+     }
 }

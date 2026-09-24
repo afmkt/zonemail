@@ -87,3 +87,16 @@ hickory-proto = "0.24"
 
 # Utilities
 thiserror = "*"
+
+[features]
+default = []
+# Gate for test-only constructors (e.g. `ServiceManager::for_test`) so the
+# black-box integration tests can build a manager without opening a real
+# socket. Enabled only in dev via the self dev-dependency below.
+test-support = []
+
+[dev-dependencies]
+# Re-depend on the crate itself with `test-support` so the integration tests
+# can reach `ServiceManager::for_test` (a `#[cfg(test)]`-gated item inside the
+# library is otherwise invisible to a separate test crate).
+zonemail = { path = ".", features = ["test-support"] }

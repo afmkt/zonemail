@@ -1,4 +1,5 @@
 use crate::db::RecordDTO;
+use crate::services::BootMode;
 use config::{Config as ConfigLoader, ConfigError, Environment, File};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -54,6 +55,11 @@ pub struct Config {
     pub domains: Vec<String>,
     pub records: Vec<RecordDTO>,
     pub mailboxes: Vec<MailboxEntry>,
+      /// Which optional servers to bring up at boot (`full`/`smtp`/`dns`/`api-only`).
+      /// `None` means "use the default", which is `full` (SMTP + DNS) -- the
+      /// historical always-on behaviour. The HTTP API can override this at runtime.
+    #[serde(default)]
+    pub mode: Option<BootMode>,
 }
 
 impl Default for Config {
@@ -67,6 +73,7 @@ impl Default for Config {
             domains: Vec::new(),
             records: Vec::new(),
             mailboxes: Vec::new(),   // Vec<MailboxEntry> is empty by default
+            mode: None,            // default BootMode (full) applied via resolved_mode()
         }
     }
 }
@@ -95,6 +102,12 @@ impl Config {
     pub fn dns_addr(&self) -> Result<SocketAddr, std::net::AddrParseError> {
         format!("{}:{}", self.host, self.dns).parse()
     }
+
+    /// The boot mode to start with: an explicit `mode` if set, else the default
+    /// (`full` = SMTP + DNS), preserving the historical always-on behaviour.
+    pub fn resolved_mode(&self) -> BootMode {
+        self.mode.unwrap_or_default()
+    }
 }
 
 // ===========================================================================
@@ -106,6 +119,8 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::services::Service;
 
          #[test]
     fn mailbox_entry_simple_has_no_forward() {
@@ -168,6 +183,28 @@ mod tests {
         assert!(cfg.records.is_empty());
         assert!(cfg.mailboxes.is_empty());
         }
+
+        #[test]
+    fn resolved_mode_defaults_to_full() {
+               // No `mode` configured -> default is `full` (SMTP + DNS on), matching the
+               // historical always-on behaviour.
+        let cfg = Config::default();
+        assert_eq!(cfg.resolved_mode(), BootMode::Full);
+        assert!(cfg.resolved_mode().services().contains(&Service::Smtp));
+        assert!(cfg.resolved_mode().services().contains(&Service::Dns));
+          }
+
+          #[test]
+    fn resolved_mode_honors_explicit_choice_via_json() {
+        let cfg: Config = serde_json::from_str(r#"{ "mode": "dns" }"#).expect("parse");
+        assert_eq!(cfg.resolved_mode(), BootMode::Dns);
+        assert!(cfg.resolved_mode().services().contains(&Service::Dns));
+        assert!(!cfg.resolved_mode().services().contains(&Service::Smtp));
+
+        let cfg: Config = serde_json::from_str(r#"{ "mode": "api-only" }"#).expect("parse");
+        assert_eq!(cfg.resolved_mode(), BootMode::ApiOnly);
+        assert!(cfg.resolved_mode().services().is_empty());
+          }
 
          #[test]
     fn config_addr_helpers_join_host_and_port() {

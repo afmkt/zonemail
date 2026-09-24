@@ -6,7 +6,7 @@
 #
 # Any field can be overridden by an environment variable using the prefix
 # `ZONEMAIL` and the `__` separator, e.g.:
-#     ZONEMAIL__API=8081  ZONEMAIL__DNS=53  ZONEMAIL__SMTP=25
+#     ZONEMAIL__API=8081  ZONEMAIL__DNS=53  ZONEMAIL__SMTP=25  ZONEMAIL__MODE=smtp
 
 # Bind address shared by the API, DNS and SMTP listeners.
 host = "0.0.0.0"
@@ -17,6 +17,17 @@ host = "0.0.0.0"
 dns = 53
 smtp = 25
 api = 8081
+
+# Which optional listeners to start at boot. One of:
+#   "full"    — SMTP + DNS (default; the historical always-on behaviour)
+#   "smtp"    — SMTP only
+#   "dns"     — DNS only
+#   "api-only"— neither optional listener (API + outbound worker only)
+#
+# This is only the *startup* mode. At runtime the API can start/stop a service
+# (`POST /services/{service}/start|stop`) or switch modes (`POST /services/mode`).
+# The API server and the outbound delivery worker are always on and not controllable.
+mode = "full"
 
 # Toasty/libsql (turso) data source. A local libsql file is the default;
 # point at a remote turso endpoint with a `libsql://...?authToken=...` URL.

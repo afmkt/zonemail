@@ -7843,6 +7843,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "turso",
+ "zonemail",
 ]
 
 [[package]]
