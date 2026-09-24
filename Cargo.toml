@@ -8,7 +8,7 @@ readme = "README.md"
 repository = "https://github.com/afmkt/zonemail"
 homepage = "https://github.com/afmkt/zonemail"
 keywords = ["email", "smtp", "dns", "mailcatcher", "forwarder"]
-categories = ["networking", "networking::server"]
+categories = ["email", "network-programming", "web-programming::http-server", "database"]
 
 [dependencies]
 salvo = { version = "0.96", features = [
