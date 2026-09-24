@@ -11,7 +11,7 @@ keywords = ["email", "smtp", "dns", "mailcatcher", "forwarder"]
 categories = ["networking", "networking::server"]
 
 [dependencies]
-salvo = { version = "*", features = [
+salvo = { version = "0.96", features = [
     "cookie",
     "fix-http1-request-uri",
     "server",
@@ -58,31 +58,31 @@ salvo = { version = "*", features = [
     "matched-path",
     "tus",
 ] }
-config = "*"
-tokio = { version = "*", features = ["full"] }
+config = "0.15"
+tokio = { version = "1", features = ["full"] }
 
-toasty = { version = "*", features = ["turso", "postgresql", "jiff"] }
+toasty = { version = "0.10", features = ["turso", "postgresql", "jiff"] }
     # Direct dep so we can name `TransactionMode` (not re-exported by `toasty`)
     # for the atomic, write-locked claim used by the outbound worker.
     toasty-core = "0.10"
-jiff = { version = "*", features = ["serde"] }
-toasty-driver-turso = "*"
-turso = "*"
-tracing = "*"
-tracing-subscriber = "*"
-serde = { version = "*", features = ["derive"] }
-serde_json = "*"
-rust-embed = "*"
+jiff = { version = "0.2", features = ["serde"] }
+toasty-driver-turso = "0.10"
+turso = "0.7"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rust-embed = "8"
 
 # Mail & DNS Crates
-lettre = { version = "*", features = [
+lettre = { version = "0.11", features = [
     "builder",
     "smtp-transport",
     "tokio1",
     "tokio1-native-tls",
 ] }
-smtpd = "*"
-mail-parser = "*"
+smtpd = "0.1"
+mail-parser = "0.11"
 # hickory 0.26+ is the recommended fix for RUSTSEC-2026-0119, but
 # hickory-proto 0.26.3 does not compile on rustc 1.95 (missing trait impls on
 # RecordType: Clone/Copy/Eq/Hash/Debug). Pinned to 0.24 until the upstream
@@ -92,7 +92,7 @@ hickory-resolver = "0.24"
 hickory-proto = "0.24"
 
 # Utilities
-thiserror = "*"
+thiserror = "1"
 
 [features]
 default = []
@@ -111,4 +111,4 @@ zonemail = { path = ".", features = ["test-support"] }
 # Kept as a dev-dep so the binary exists for local migration work, but NOT a
 # normal dependency, so it does not leak into a consumer of the published
 # `zonemail` library's build graph.
-toasty-cli = "*"
+toasty-cli = "0.10"
