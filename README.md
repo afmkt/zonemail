@@ -94,7 +94,7 @@ RFC-7807-style error document, and list endpoints are paginated (`limit`/`offset
   fine) plus **environment overrides** (`ZONEMAIL__FIELD`, `__` separator).
 - **Pre-seed** at boot: domains, DNS records, and mailboxes (including
   forwarding targets).
-- **Boot modes** (`full` = SMTP+DNS by default, `smtp`, `dns`, `api-only`)
+- **Boot modes** (`full` = API+SMTP+DNS by default, plus `api`, `smtp`, `dns`, `off`)
   select which optional listeners start.
 
 ### Storage

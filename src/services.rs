@@ -1,7 +1,9 @@
-//! Optional server lifecycle: the SMTP and DNS listeners can be started and
-//! stopped, individually or as a named mode, both from config (at boot) and from
-//! the HTTP API (at runtime). The API and the outbound delivery worker are
-//! always on and are *not* controllable here.
+//! Optional server lifecycle: the API, inbound SMTP, and DNS listeners can be
+//! started and stopped, individually or as a named mode, both from config (at
+//! boot) and from the HTTP API (at runtime). The outbound delivery worker is
+//! *not* a controllable service — it is a background poll loop that the runtime
+//! that owns a [`Daemon`](crate::runtime::Daemon) drives on its own, never
+//! through the manager.
 //!
 //! ## Design
 //!
@@ -12,18 +14,29 @@
 //! listener loop is a bare `loop { accept }`), so abort-on-drop is the practical
 //! mechanism — the socket is freed deterministically when the task is dropped.
 //!
-//! The manager spawns servers through a pluggable [`SpawnFn`] so tests can inject
-//! a fake that never binds a real port. Production uses [`ServiceManager::new`],
-//! which spawns `run_dns_server` / `run_mail_server`; tests use `for_test`.
+//! The manager spawns listeners through a pluggable [`SpawnFn`] so tests can
+//! inject a fake that never binds a real port. Production uses
+//! [`ServiceManager::new`] (which spawns the API / SMTP / DNS runners); tests use
+//! [`ServiceManager::for_test`].
+//!
+//! The API spawn is special: its router must be affixed with the *live*
+//! `Arc<ServiceManager>` (the `/services` control handlers pull it out of the
+//! depot as `Arc<ServiceManager>`), yet the spawn closure lives *inside* that
+//! very manager. The cycle is broken with a `Weak` handoff: the manager creates
+//! a `Weak` placeholder, hands it to the spawn closure, and fills it in with its
+//! own `Arc` once constructed. By the time any listener starts, the `Weak`
+//! upgrades to the live manager.
+use crate::api::api_with_doc;
 use crate::app::AppState;
 use crate::config::Config;
 use crate::dns::run_dns_server;
 use crate::email::run_mail_server;
 use salvo::oapi::ToSchema;
+use salvo::{affix_state, prelude::*};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
@@ -31,39 +44,45 @@ use tracing::warn;
 // Service identity and status
 // ===========================================================================
 
-/// A controllable optional server. The API and the outbound worker are *not*
-/// members: they are always on.
+/// A controllable listener that can be started or stopped. The outbound delivery
+/// worker is *not* a member — it is a background poll loop, not a listener, and
+/// the runtime that owns a [`Daemon`](crate::runtime::Daemon) drives it
+/// independently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Service {
-    /// The DNS (`:53` by default) listener.
-    Dns,
+    /// The HTTP API (`:8081` by default) listener.
+    Api,
     /// The inbound SMTP (`:25` by default) listener.
     Smtp,
+    /// The DNS (`:53` by default) listener.
+    Dns,
 }
 
 impl Service {
     /// Every controllable service, in a stable order.
-    pub fn all() -> [Service; 2] {
-        [Service::Dns, Service::Smtp]
-     }
+    pub fn all() -> [Service; 3] {
+        [Service::Api, Service::Smtp, Service::Dns]
+    }
 
     /// Parse a service name from the wire (path param / API body), case-insensitive.
     pub fn parse(s: &str) -> Option<Service> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "dns" => Some(Service::Dns),
+            "api" => Some(Service::Api),
             "smtp" => Some(Service::Smtp),
+            "dns" => Some(Service::Dns),
             _ => None,
-         }
-     }
+        }
+    }
 
     /// The human-facing name used in messages and responses.
     pub fn as_str(&self) -> &'static str {
         match self {
-            Service::Dns => "dns",
+            Service::Api => "api",
             Service::Smtp => "smtp",
-         }
-     }
+            Service::Dns => "dns",
+        }
+    }
 }
 
 /// Whether a service is currently listening. Purely a control-plane intent:
@@ -85,15 +104,20 @@ pub enum Status {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum BootMode {
-    /// Both SMTP and DNS. (Default — preserves the historical "everything on".)
+    /// All three controllable listeners: API + inbound SMTP + DNS. (Default — the
+    /// historical "everything on" behaviour, now including the API as a service.)
     #[default]
     Full,
-    /// SMTP only.
+    /// API only.
+    Api,
+    /// Inbound SMTP only.
     Smtp,
     /// DNS only.
     Dns,
-    /// Neither optional server (API + outbound worker only).
-    ApiOnly,
+    /// No controllable listener (the API off too) — the embedding shape: mount the
+    /// routes via [`Daemon::routes`](crate::runtime::Daemon::routes) and/or leave
+    /// services idle. The outbound worker is unaffected by a mode.
+    Off,
 }
 
 impl BootMode {
@@ -102,16 +126,20 @@ impl BootMode {
         let mut set = HashSet::new();
         match self {
             BootMode::Full => {
+                set.insert(Service::Api);
                 set.insert(Service::Smtp);
                 set.insert(Service::Dns);
             }
+            BootMode::Api => {
+                set.insert(Service::Api);
+            }
             BootMode::Smtp => {
                 set.insert(Service::Smtp);
-              }
+            }
             BootMode::Dns => {
                 set.insert(Service::Dns);
-              }
-            BootMode::ApiOnly => {}
+            }
+            BootMode::Off => {}
         }
         set
     }
@@ -143,7 +171,7 @@ pub struct ServiceResult {
 // ===========================================================================
 
 /// The spawn seam. Returns an already-spawned task for the given service; the
-/// production implementation wraps the real SMTP/DNS runners, tests wrap a
+/// production implementation wraps the real API / SMTP / DNS runners, tests wrap a
 /// fake. Kept *synchronous* so the manager never awaits while holding its lock.
 type SpawnFn = dyn Fn(Service, SocketAddr) -> Result<JoinHandle<()>, String> + Send + Sync;
 
@@ -153,13 +181,15 @@ struct Slot {
 }
 
 struct Inner {
+    api: Slot,
     dns: Slot,
     smtp: Slot,
+    api_addr: SocketAddr,
     dns_addr: SocketAddr,
     smtp_addr: SocketAddr,
 }
 
-/// A lock-guarded control plane over the optional SMTP/DNS listeners.
+/// A lock-guarded control plane over the controllable API / SMTP / DNS listeners.
 ///
 /// Shares a single [`Mutex`] so concurrent start/stop requests are serialized and
 /// can never double-spawn a service. Cloning is cheap (`Arc`); the clone reaches
@@ -174,83 +204,130 @@ impl Inner {
     /// The slot for a service, mutably.
     fn slot_mut(&mut self, svc: Service) -> &mut Slot {
         match svc {
+            Service::Api => &mut self.api,
             Service::Dns => &mut self.dns,
             Service::Smtp => &mut self.smtp,
-         }
-     }
+        }
+    }
 
     /// The bind address a service listens on, from config.
     fn addr(&self, svc: Service) -> SocketAddr {
         match svc {
+            Service::Api => self.api_addr,
             Service::Dns => self.dns_addr,
             Service::Smtp => self.smtp_addr,
-         }
-     }
+        }
+    }
 
     fn status_of(&self, svc: Service) -> Status {
         match svc {
+            Service::Api => self.api.status,
             Service::Dns => self.dns.status,
             Service::Smtp => self.smtp.status,
-         }
-     }
+        }
+    }
 }
 
 impl ServiceManager {
-    /// Production manager: spawns the real `run_dns_server` / `run_mail_server`
-    /// for each service, bound to the addresses in `cfg`. Does not spawn anything
-    /// at construction time — boot the services with [`ServiceManager::boot`].
-    pub fn new(cfg: &Config, app: Arc<AppState>) -> Self {
+    /// Production manager: spawns the real API / `run_mail_server` /
+    /// `run_dns_server` for each service, bound to the addresses in `cfg`. Does
+    /// not spawn anything at construction time — boot the services with
+    /// [`ServiceManager::boot`].
+    ///
+    /// Returns `Arc<Self>` so the manager can be injected into the API router by
+    /// its own shared identity; the API spawn upgrades the internal `Weak` back to
+    /// this same `Arc`.
+    pub fn new(cfg: &Config, app: Arc<AppState>) -> Arc<Self> {
         let dns_addr = cfg
-             .dns_addr()
-             .expect("config dns address must be valid; validated at load");
+            .dns_addr()
+            .expect("config dns address must be valid; validated at load");
         let smtp_addr = cfg
-             .smtp_addr()
-             .expect("config smtp address must be valid; validated at load");
+            .smtp_addr()
+            .expect("config smtp address must be valid; validated at load");
+        let api_addr = cfg
+            .api_addr()
+            .expect("config api address must be valid; validated at load");
 
-        let spawn: Arc<SpawnFn> = Arc::new(move |svc: Service, addr: SocketAddr| {
-            let app = app.clone();
-            let handle = match svc {
-                Service::Dns => tokio::spawn(async move {
-                    if let Err(e) = run_dns_server(addr, app).await {
-                        warn!("DNS server stopped: {e}");
-                    }
-                }),
-                Service::Smtp => tokio::spawn(async move {
+        let inner = Arc::new(Mutex::new(Inner {
+            api: Slot { status: Status::Idle, handle: None },
+            dns: Slot { status: Status::Idle, handle: None },
+            smtp: Slot { status: Status::Idle, handle: None },
+            api_addr,
+            dns_addr,
+            smtp_addr,
+        }));
+
+        // A `Weak` to the manager itself, filled in below once the `Arc` exists.
+        // The API spawn upgrades it so the API router can be affixed with the live
+        // manager (the `/services` handlers read it out of the depot).
+        let weak: Arc<Mutex<Weak<ServiceManager>>> = Arc::new(Mutex::new(Weak::new()));
+        let weak_for_spawn = weak.clone();
+        let app_for_spawn = app.clone();
+
+        let spawn: Arc<SpawnFn> = Arc::new(move |svc, addr| match svc {
+            Service::Api => {
+                let app = app_for_spawn.clone();
+                let mgr = weak_for_spawn
+                    .lock()
+                        .expect("service-manager weak poisoned")
+                        .upgrade()
+                    .expect("ServiceManager must outlive its spawned API task");
+                let handle = tokio::spawn(async move {
+                    // Affixed, exactly as the daemon wires it elsewhere: `AppState`
+                    // *by value* (keyed by its `TypeId`), then the live
+                    // `Arc<ServiceManager>` as a second depot value.
+                    let router = api_with_doc()
+                        .hoop(affix_state::inject((*app).clone()))
+                        .hoop(affix_state::inject(mgr));
+                    let acceptor = TcpListener::new(addr).bind().await;
+                    Server::new(acceptor).serve(router).await;
+                });
+                Ok(handle)
+            }
+            Service::Smtp => {
+                let app = app_for_spawn.clone();
+                let handle = tokio::spawn(async move {
                     if let Err(e) = run_mail_server(addr, app).await {
                         warn!("SMTP server stopped: {e}");
                     }
-                }),
-            };
-            Ok(handle)
-         });
+                });
+                Ok(handle)
+            }
+            Service::Dns => {
+                let app = app_for_spawn.clone();
+                let handle = tokio::spawn(async move {
+                    if let Err(e) = run_dns_server(addr, app).await {
+                        warn!("DNS server stopped: {e}");
+                    }
+                });
+                Ok(handle)
+            }
+        });
 
-        ServiceManager {
-            inner: Arc::new(Mutex::new(Inner {
-                dns: Slot { status: Status::Idle, handle: None },
-                smtp: Slot { status: Status::Idle, handle: None },
-                dns_addr,
-                smtp_addr,
-             })),
-            spawn,
-         }
-     }
+        let arc = Arc::new(ServiceManager { inner, spawn });
+        *weak.lock().expect("service-manager weak poisoned") = Arc::downgrade(&arc);
+        arc
+    }
 
     /// A test manager: a fake spawner that creates a task which lives until it is
-    /// aborted (so no real port is ever bound). Bind addresses are inert.
+    /// aborted (so no real port is ever bound, even for the API). Bind addresses
+    /// are inert.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn for_test() -> Self {
+    pub fn for_test() -> Arc<Self> {
         let spawn: Arc<SpawnFn> =
-             Arc::new(|_svc: Service, _addr: SocketAddr| Ok(tokio::spawn(std::future::pending::<()>())));
-        ServiceManager {
+            Arc::new(|_svc, _addr| Ok(tokio::spawn(std::future::pending::<()>())));
+        Arc::new(ServiceManager {
             inner: Arc::new(Mutex::new(Inner {
+                api: Slot { status: Status::Idle, handle: None },
                 dns: Slot { status: Status::Idle, handle: None },
                 smtp: Slot { status: Status::Idle, handle: None },
+                api_addr: "127.0.0.1:0".parse().unwrap(),
                 dns_addr: "127.0.0.1:0".parse().unwrap(),
                 smtp_addr: "127.0.0.1:0".parse().unwrap(),
-             })),
+            })),
             spawn,
-         }
-     }
+        })
+    }
 
     /// Start one service. Idempotent: starting an already-running service is a
     /// no-op that reports `changed: false`. A bind/spawn failure surfaces as
@@ -262,13 +339,13 @@ impl ServiceManager {
 
         if matches!(slot.status, Status::Running) {
             return Ok(ServiceResult { service: svc, status: Status::Running, changed: false });
-         }
+        }
 
         let handle = (self.spawn)(svc, addr)?;
         slot.handle = Some(handle);
         slot.status = Status::Running;
         Ok(ServiceResult { service: svc, status: Status::Running, changed: true })
-     }
+    }
 
     /// Stop one service. Idempotent: stopping an already-idle service is a no-op
     /// that reports `changed: false`. Aborts the task, which drops its bound
@@ -281,24 +358,24 @@ impl ServiceManager {
             handle.abort();
             slot.status = Status::Idle;
             return Ok(ServiceResult { service: svc, status: Status::Idle, changed: true });
-         }
+        }
 
         Ok(ServiceResult { service: svc, status: Status::Idle, changed: false })
-     }
+    }
 
     /// The current status of one service.
     pub fn status_of(&self, svc: Service) -> Status {
         self.inner.lock().expect("service manager poisoned").status_of(svc)
-     }
+    }
 
     /// A status report for every controllable service, in a stable order.
     pub fn list(&self) -> Vec<ServiceReport> {
         let guard = self.inner.lock().expect("service manager poisoned");
         Service::all()
-             .into_iter()
-             .map(|svc| ServiceReport { service: svc, status: guard.status_of(svc) })
-             .collect()
-     }
+            .into_iter()
+            .map(|svc| ServiceReport { service: svc, status: guard.status_of(svc) })
+            .collect()
+    }
 
     /// Bring up a named mode: start every service the mode wants, stop the rest.
     /// Returns the resulting list of statuses.
@@ -309,12 +386,12 @@ impl ServiceManager {
                 if let Err(e) = self.start(svc) {
                     warn!("Failed to start {svc:?} for mode {mode:?}: {e}");
                 }
-             } else {
+            } else {
                 let _ = self.stop(svc);
-             }
-         }
+            }
+        }
         self.list()
-     }
+    }
 
     /// Boot the services named by a mode (used at startup). Best-effort: a service
     /// that fails to spawn is logged but does not prevent the others from starting.
@@ -323,15 +400,15 @@ impl ServiceManager {
             if let Err(e) = self.start(svc) {
                 warn!("Failed to boot {svc:?} from mode {mode:?}: {e}");
             }
-         }
-     }
+        }
+    }
 
     /// Stop every controllable service.
     pub fn stop_all(&self) {
         for svc in Service::all() {
             let _ = self.stop(svc);
-         }
-     }
+        }
+    }
 }
 
 // ===========================================================================
@@ -348,20 +425,24 @@ mod tests {
 
     #[test]
     fn boot_mode_services_map_correctly() {
-        assert_eq!(BootMode::Full.services(), HashSet::from([Service::Smtp, Service::Dns]));
+        assert_eq!(
+            BootMode::Full.services(),
+            HashSet::from([Service::Api, Service::Smtp, Service::Dns])
+        );
+        assert_eq!(BootMode::Api.services(), HashSet::from([Service::Api]));
         assert_eq!(BootMode::Smtp.services(), HashSet::from([Service::Smtp]));
         assert_eq!(BootMode::Dns.services(), HashSet::from([Service::Dns]));
-        assert!(BootMode::ApiOnly.services().is_empty());
+        assert!(BootMode::Off.services().is_empty());
         assert_eq!(BootMode::default(), BootMode::Full);
-     }
+    }
 
     #[test]
     fn service_parse_is_case_insensitive_and_rejects_unknown() {
+        assert_eq!(Service::parse("api"), Some(Service::Api));
         assert_eq!(Service::parse("dns"), Some(Service::Dns));
         assert_eq!(Service::parse(" SMTP "), Some(Service::Smtp));
-        assert_eq!(Service::parse("api"), None);
         assert_eq!(Service::parse("bogus"), None);
-     }
+    }
 
     #[tokio::test]
     async fn start_is_idempotent_and_reflects_status() {
@@ -377,7 +458,7 @@ mod tests {
         let second = mgr.start(Service::Smtp).unwrap();
         assert!(!second.changed);
         assert_eq!(mgr.status_of(Service::Smtp), Status::Running);
-     }
+    }
 
     #[tokio::test]
     async fn stop_is_idempotent() {
@@ -392,28 +473,31 @@ mod tests {
         // Stopping an idle service is a no-op.
         let second = mgr.stop(Service::Dns).unwrap();
         assert!(!second.changed);
-     }
+    }
 
     #[tokio::test]
     async fn apply_mode_starts_wanted_and_stops_rest() {
         let mgr = ServiceManager::for_test();
         mgr.boot(BootMode::Full);
+        assert_eq!(mgr.status_of(Service::Api), Status::Running);
         assert_eq!(mgr.status_of(Service::Smtp), Status::Running);
         assert_eq!(mgr.status_of(Service::Dns), Status::Running);
 
         let reports = mgr.apply_mode(BootMode::Dns);
+        assert_eq!(mgr.status_of(Service::Api), Status::Idle);
         assert_eq!(mgr.status_of(Service::Smtp), Status::Idle);
         assert_eq!(mgr.status_of(Service::Dns), Status::Running);
-        assert_eq!(reports.len(), 2);
-     }
+        assert_eq!(reports.len(), 3);
+    }
 
     #[tokio::test]
-    async fn list_reports_both_services() {
+    async fn list_reports_all_services() {
         let mgr = ServiceManager::for_test();
         mgr.start(Service::Smtp).unwrap();
         let reports = mgr.list();
-        assert_eq!(reports.len(), 2);
+        assert_eq!(reports.len(), 3);
         assert!(reports.iter().any(|r| r.service == Service::Smtp && r.status == Status::Running));
         assert!(reports.iter().any(|r| r.service == Service::Dns && r.status == Status::Idle));
-     }
+        assert!(reports.iter().any(|r| r.service == Service::Api && r.status == Status::Idle));
+    }
 }

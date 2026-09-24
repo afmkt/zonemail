@@ -166,7 +166,7 @@ async fn health_probe_and_unmatched_route() {
 /// An API service that also carries a test `ServiceManager` (no real sockets)
 /// alongside the usual in-memory `AppState`.
 async fn service_api_service() -> salvo::Service {
-     let mgr = std::sync::Arc::new(ServiceManager::for_test());
+     let mgr = ServiceManager::for_test();
      let state = AppState::connect_in_memory().await.expect("in-memory state");
      let router = create_router()
         .hoop(affix_state::inject(state))
@@ -175,7 +175,7 @@ async fn service_api_service() -> salvo::Service {
 }
 
     #[tokio::test]
-async fn services_list_reports_both_listeners_idle_by_default() {
+async fn services_list_reports_all_listeners_idle_by_default() {
      let service = service_api_service().await;
 
      let mut res = TestClient::get("http://localhost/services").send(&service).await;
@@ -183,10 +183,12 @@ async fn services_list_reports_both_listeners_idle_by_default() {
      let body: ApiResponse<Vec<zonemail::services::ServiceReport>> =
         res.take_json().await.expect("json body");
      assert!(body.ok, "list ok");
-     assert_eq!(body.data.len(), 2, "one report per controllable service");
-     assert!(body.data.iter().all(|r| r.status == Status::Idle), "both idle at boot");
+     assert_eq!(body.data.len(), 3, "one report per controllable service");
+     assert!(body.data.iter().all(|r| r.status == Status::Idle), "all idle at boot");
+     let has_api = body.data.iter().any(|r| r.service == Service::Api);
      let has_dns = body.data.iter().any(|r| r.service == Service::Dns);
      let has_smtp = body.data.iter().any(|r| r.service == Service::Smtp);
+     assert!(has_api, "a report for api");
      assert!(has_dns, "a report for dns");
      assert!(has_smtp, "a report for smtp");
 }
@@ -271,9 +273,9 @@ async fn service_mode_switches_all_listeners() {
 async fn service_control_rejects_non_controllable_names() {
      let service = service_api_service().await;
 
-        // The API worker and outbound consumer are always-on and have no control
-        // route: a lifecycle path for them 400s instead of silently no-oping.
-     for name in ["api", "outbound"] {
+        // Only the outbound delivery worker has no control route: a lifecycle path for it
+        // instead of silently no-oping (`api`/`smtp`/`dns` are the controllable services).
+     for name in ["outbound"] {
         let res =
              TestClient::post(format!("http://localhost/services/{name}/start"))
                .send(&service)

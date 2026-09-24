@@ -55,9 +55,10 @@ pub struct Config {
     pub domains: Vec<String>,
     pub records: Vec<RecordDTO>,
     pub mailboxes: Vec<MailboxEntry>,
-      /// Which optional servers to bring up at boot (`full`/`smtp`/`dns`/`api-only`).
-      /// `None` means "use the default", which is `full` (SMTP + DNS) -- the
-      /// historical always-on behaviour. The HTTP API can override this at runtime.
+      /// Which controllable listeners to bring up at boot
+      /// (`full`/`api`/`smtp`/`dns`/`off`). `None` means "use the default",
+      /// which is `full` (API + inbound SMTP + DNS) — the historical always-on
+      /// behaviour. The HTTP API can override this at runtime.
     #[serde(default)]
     pub mode: Option<BootMode>,
 }
@@ -104,7 +105,7 @@ impl Config {
     }
 
     /// The boot mode to start with: an explicit `mode` if set, else the default
-    /// (`full` = SMTP + DNS), preserving the historical always-on behaviour.
+    /// (`full` = API + SMTP + DNS). This is the historical always-on behaviour.
     pub fn resolved_mode(&self) -> BootMode {
         self.mode.unwrap_or_default()
     }
@@ -186,7 +187,7 @@ mod tests {
 
         #[test]
     fn resolved_mode_defaults_to_full() {
-               // No `mode` configured -> default is `full` (SMTP + DNS on), matching the
+               // No `mode` configured -> default is `full` (API + SMTP + DNS on), matching the
                // historical always-on behaviour.
         let cfg = Config::default();
         assert_eq!(cfg.resolved_mode(), BootMode::Full);
@@ -201,8 +202,8 @@ mod tests {
         assert!(cfg.resolved_mode().services().contains(&Service::Dns));
         assert!(!cfg.resolved_mode().services().contains(&Service::Smtp));
 
-        let cfg: Config = serde_json::from_str(r#"{ "mode": "api-only" }"#).expect("parse");
-        assert_eq!(cfg.resolved_mode(), BootMode::ApiOnly);
+        let cfg: Config = serde_json::from_str(r#"{ "mode": "off" }"#).expect("parse");
+        assert_eq!(cfg.resolved_mode(), BootMode::Off);
         assert!(cfg.resolved_mode().services().is_empty());
           }
 

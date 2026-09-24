@@ -18,15 +18,17 @@ dns = 53
 smtp = 25
 api = 8081
 
-# Which optional listeners to start at boot. One of:
-#   "full"    — SMTP + DNS (default; the historical always-on behaviour)
-#   "smtp"    — SMTP only
-#   "dns"     — DNS only
-#   "api-only"— neither optional listener (API + outbound worker only)
+# Which controllable listeners to start at boot. One of:
+#     "full"   - API + SMTP + DNS (default; the historical always-on behaviour)
+#     "api"    - API only
+#     "smtp"   - inbound SMTP only
+#     "dns"    - DNS only
+#     "off"    - no controllable listener (mount the routes via Daemon::routes)
 #
 # This is only the *startup* mode. At runtime the API can start/stop a service
 # (`POST /services/{service}/start|stop`) or switch modes (`POST /services/mode`).
-# The API server and the outbound delivery worker are always on and not controllable.
+# The outbound delivery worker is not controllable - the runtime that owns the
+# daemon drives it independently.
 mode = "full"
 
 # Toasty/libsql (turso) data source. A local libsql file is the default;

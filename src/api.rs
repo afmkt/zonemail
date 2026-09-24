@@ -1903,7 +1903,7 @@ mod tests {
         /// routes can be exercised without opening :25/:53.
     async fn service_api_service() -> salvo::Service {
         use crate::services::ServiceManager;
-        let mgr = std::sync::Arc::new(ServiceManager::for_test());
+        let mgr = ServiceManager::for_test();
         let state = AppState::connect_in_memory().await.expect("in-memory state");
         let router = (create_router())
                   .hoop(salvo::affix_state::inject(state))
@@ -1918,10 +1918,14 @@ mod tests {
         assert_eq!(res.status_code, Some(StatusCode::OK));
         let body: ApiResponse<Vec<ServiceReport>> = res.take_json().await.expect("json body");
         assert!(body.ok);
-        assert_eq!(body.data.len(), 2);
+        assert_eq!(body.data.len(), 3);
         for r in &body.data {
             assert_eq!(r.status, Status::Idle);
-            assert!(r.service == Service::Dns || r.service == Service::Smtp);
+            assert!(
+                r.service == Service::Api
+                     || r.service == Service::Dns
+                     || r.service == Service::Smtp
+                 );
               }
             }
 
@@ -1941,8 +1945,9 @@ mod tests {
         let r: ApiResponse<ServiceResult> = res.take_json().await.expect("json body");
         assert!(!r.data.changed);
 
-              // A non-controllable service name 400s (the API worker has no route).
-        let res = TestClient::post("http://localhost/services/api/start").send(&service).await;
+              // The outbound delivery worker is *not* a controllable service, so a start
+            // for it has no route and 400s (`api`/`smtp`/`dns` are the three services).
+        let res = TestClient::post("http://localhost/services/outbound/start").send(&service).await;
         assert_eq!(res.status_code, Some(StatusCode::BAD_REQUEST));
 
               // Stop is a real change once; a second stop is a no-op.
@@ -1975,7 +1980,7 @@ mod tests {
         assert_eq!(dns.status, Status::Running);
         assert_eq!(smtp.status, Status::Idle);
 
-              // A full-mode switch brings both up.
+              // A full-mode switch brings all three up.
         let mut res =
              TestClient::post("http://localhost/services/mode")
                             .json(&serde_json::json!({ "mode": "full" }))
@@ -1983,7 +1988,7 @@ mod tests {
                             .await;
         assert_eq!(res.status_code, Some(StatusCode::OK));
         let body: ApiResponse<Vec<ServiceReport>> = res.take_json().await.expect("json body");
-        assert_eq!(body.data.len(), 2);
+        assert_eq!(body.data.len(), 3);
         assert!(body.data.iter().all(|r| r.status == Status::Running));
 
               // An unknown mode 400s.
