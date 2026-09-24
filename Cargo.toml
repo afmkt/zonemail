@@ -67,7 +67,6 @@ toasty = { version = "*", features = ["turso", "postgresql", "jiff"] }
     toasty-core = "0.10"
 jiff = { version = "*", features = ["serde"] }
 toasty-driver-turso = "*"
-toasty-cli = "*"
 turso = "*"
 tracing = "*"
 tracing-subscriber = "*"
@@ -107,3 +106,9 @@ test-support = []
 # can reach `ServiceManager::for_test` (a `#[cfg(test)]`-gated item inside the
 # library is otherwise invisible to a separate test crate).
 zonemail = { path = ".", features = ["test-support"] }
+
+# DB migrations are driven by the `toasty` CLI, not by Rust code in this crate.
+# Kept as a dev-dep so the binary exists for local migration work, but NOT a
+# normal dependency, so it does not leak into a consumer of the published
+# `zonemail` library's build graph.
+toasty-cli = "*"
