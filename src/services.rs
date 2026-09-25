@@ -278,7 +278,8 @@ impl ServiceManager {
                     // `Arc<ServiceManager>` as a second depot value.
                     let router = api_with_doc()
                         .hoop(affix_state::inject((*app).clone()))
-                        .hoop(affix_state::inject(mgr));
+                        .hoop(affix_state::inject(mgr))
+                        .hoop(crate::auth::AuthGuard::new(app.auth.clone()));
                     let acceptor = TcpListener::new(addr).bind().await;
                     Server::new(acceptor).serve(router).await;
                 });

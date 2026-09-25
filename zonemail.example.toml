@@ -52,3 +52,81 @@ records = []
 #      { id = "billing@example.com", forward_to = "ops@example.org" },  # forwarded
 # ]
 mailboxes = []
+
+# ===========================================================================
+# HTTP API authentication & authorization (JWT / bearer).
+#
+# When `enabled = false` (the default) the API is fully open and the guard is a
+# pure pass-through - zero behaviour or latency change. Flip `enabled = true` to
+# require a valid bearer JWT on every governed route; `health` and `doc` stay
+# public so probes/docs remain reachable. Default-deny when enabled - there is no
+# opt-out. The model is config-only: zonemail is a *verifier*, not an authz
+# server, so roles are declared here and the upstream auth server mints tokens
+# that name one of these roles.
+#
+# auth = {
+#    enabled = false,
+#
+#     # Expected token claims. Leave unset to skip the check.
+#    issuer = "https://janux.example.com",
+#    audience = "zonemail-api",
+#
+#     # Tolerance (seconds) for `exp`/`nbf` clock drift.
+#    clock_skew_secs = 30,
+#
+#     # Claim names (configurable). `role_claims` names one or more fields; each
+#     # may be a bare string or an array of strings, all unioned into the set.
+#    subject_claim = "sub",
+#    role_claims = [ "role" ],           # e.g. [ "role", "roles" ]
+#
+#     # Resources that stay open even when auth is enabled. `health` and `doc` are
+#     # public by default; add/remove here.
+#    public = [ "health", "doc" ],
+#
+#     # --- Where the verification key material comes from (exactly one kind) -----
+#
+#     # (a) Symmetric HMAC secret. Prefer `secret_env` to keep it out of the file:
+#     #      kind = "secret"  secret_env = "ZONEMAIL_JWT_SECRET"   # the env var NAME
+#     #    ... or inline:
+#     #      kind = "secret"  secret     = "a-long-shared-secret"
+#     #      kind = "secret"  secret_b64 = "<base64-of-the-secret>"
+#
+#     # (b) Inline JWKS - a key *set* object written in the config, evaluated locally:
+#     #      kind = "jwks"
+#     #      jwks = { keys = [ { kty = "RSA", kid = "1", n = "..", e = "AQAB" } ] }
+#
+#     # (c) Remote JWKS (e.g. Janux) fetched & refreshed in the background:
+#     #      kind = "jwks_remote"
+#     #      jwks_url = "https://janux.example.com/.well-known/jwks.json"
+#     #       # credential presented *to the auth server* (not to zonemail callers):
+#     #      janux_auth_header = "Authorization"    # default
+#     #      janux_bearer = true                   # default; wrap token as "Bearer .."
+#     #      janux_token = "..."                   # or via env, not in this file
+#     #       # refresh cadence / cache TTL / fail policy:          (defaults 300/300/true)
+#     #      refresh_interval_secs = 300
+#     #      cache_ttl_secs = 300
+#     #      fail_closed = true                    # deny if source unreachable + empty cache
+#
+#     # (d) Issuer / OIDC discovery - zonemail fetches
+#     #       `<issuer><discovery_path>` for the `jwks_uri` (or uses `jwks_path`):
+#     #      kind = "issuer"
+#     #      issuer = "https://janux.example.com"
+#     #      discovery_path = "/.well-known/openid-configuration"   # default
+#     #      jwks_path = ".well-known/jwks.json"                    # bypass discovery
+#
+#     # Allowed signature algorithms. Blocks `alg=none` and HS<->RS confusion; when
+#     # empty the kind's default is used (HS* for `secret`, RS256 otherwise).
+#    algorithms = [ "RS256" ],
+#   }
+#
+#   # Named roles. `grants` are `"*"`, `"<resource>:*"`, `"*:<verb>"`, or
+#   # "<resource>:<verb>". `extends` inherits another role's grants (unioned).
+#   # [auth.roles.admin]
+#   #   grants = [ "*" ]
+#   #
+#   # [auth.roles.viewer]
+#   #   grants = [ "domains:read", "records:read" ]
+#   #
+#   # [auth.roles.ops]
+#   #   extends = [ "viewer" ]
+#   #   grants = [ "mailboxes:*", "*:read" ]

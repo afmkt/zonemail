@@ -66,6 +66,7 @@ impl Daemon {
         api_with_doc()
              .hoop(affix_state::inject((*self.app).clone()))
              .hoop(affix_state::inject(self.services.clone()))
+             .hoop(crate::auth::AuthGuard::new(self.app.auth.clone()))
      }
 
      /// The controllable service manager — start/stop individual services, query

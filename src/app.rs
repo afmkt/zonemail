@@ -22,6 +22,9 @@ use tracing::info;
 #[derive(Clone)]
 pub struct AppState {
     pub db: toasty::Db,
+    /// The JWT authn/authz enforcer. `None`/disabled ⇒ the guard is a no-op and
+    /// the API is fully open, exactly as before the feature existed.
+    pub auth: std::sync::Arc<crate::auth::AuthService>,
 }
 
 impl AppState {
@@ -49,7 +52,12 @@ impl AppState {
             }
         }
 
-        let mut ctx = Self { db };
+        let mut ctx = Self {
+            db,
+            // Build the authenticator from config. When `auth.enabled = false`
+            // this is effectively a no-op service; when enabled it enforces it.
+            auth: crate::auth::AuthService::build(&config.auth)?,
+          };
 
         // 3. Seed data from config
         ctx.seed_from_config(config).await?;
@@ -98,7 +106,13 @@ impl AppState {
             }
         }
 
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            // `from_driver` is used by `connect`/`connect_in_memory` (no config
+            // here), so authentication is left disabled by default. Callers that
+            // need auth build the service and inject it explicitly.
+            auth: crate::auth::AuthService::disabled(),
+          })
       }
     async fn seed_from_config(
         &mut self,

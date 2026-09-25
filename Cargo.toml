@@ -94,6 +94,24 @@ hickory-proto = "0.24"
 # Utilities
 thiserror = "1"
 
+# `http` types are used by the auth layer when constructing/inspecting request
+# URIs and headers (e.g. the `enforce` decision tests). It is already in the tree
+# via `salvo`/`reqwest`; declared here so the crate can name `http::Uri` directly.
+http = "1"
+
+# JWT verification for the HTTP API auth layer. The `aws-lc-rs` crypto backend
+# it needs comes for free via salvos `aws-lc-rs` feature, so no extra feature is
+# selected here (RustCrypto and aws-lc-rs must not be enabled simultaneously, and
+# only aws-lc-rs is in the graph).
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
+base64 = "0.22"
+
+# Async HTTP client used only when key material is sourced *dynamically* from an
+# auth server (e.g. Janux) — `auth.keys.kind = "jwks_remote"`/`"issuer"` — to
+# fetch a rotating JWKS / OIDC discovery. rustls to match the service's TLS
+# stack; no default features keeps the footprint minimal.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+
 [features]
 default = []
 # Gate for test-only constructors (e.g. `ServiceManager::for_test`) so the
