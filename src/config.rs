@@ -136,9 +136,9 @@ pub struct AuthConfig {
 
       /// Expected `iss` claim. When set, tokens whose issuer differs are rejected.
     pub issuer: Option<String>,
-      /// Expected `aud` claim. When set, tokens not addressed to this audience are
-      /// rejected.
-    pub audience: Option<String>,
+       /// Expected `aud` claim(s). When non-empty a token not in this set is rejected.
+      #[serde(default, deserialize_with = "deserialize_audience")]
+    pub audience: Vec<String>,
       /// Clock skew (seconds) tolerated for `exp`/`nbf`. Default 30.
     pub clock_skew_secs: u64,
       /// Claim name carrying the caller's principal identity (informational; not
@@ -160,12 +160,31 @@ pub struct AuthConfig {
     pub roles: HashMap<String, RoleConfig>,
 }
 
+/// Serde helper: accept both `audience = "foo"` (bare string) and
+/// `audience = ["foo", "bar"]` in TOML/JSON, normalising to `Vec<String>`.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum OneOrManyStrings {
+    Single(String),
+    Many(Vec<String>),
+}
+
+fn deserialize_audience<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+      where
+        D: serde::Deserializer<'de>,
+   {
+        match OneOrManyStrings::deserialize(deserializer)? {
+             OneOrManyStrings::Single(s) => Ok(vec![s]),
+             OneOrManyStrings::Many(v) => Ok(v),
+        }
+   }
+
 impl Default for AuthConfig {
     fn default() -> Self {
         AuthConfig {
             enabled: false,
             issuer: None,
-            audience: None,
+            audience: Vec::new(),
             clock_skew_secs: 30,
             subject_claim: "sub".to_string(),
             role_claims: vec!["role".to_string()],
@@ -501,7 +520,7 @@ mod tests {
              "auth": {
                "enabled": true,
                "issuer": "https://janux.example.com",
-               "audience": "zonemail-api",
+               "audience": ["zonemail-api"],
                "role_claims": ["role", "roles"],
                "public": ["health", "doc"],
                "keys": {

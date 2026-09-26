@@ -164,7 +164,7 @@ pub struct AuthService {
     enabled: bool,
         // Optional issuer/audience constraints applied to every decoded token.
     issuer: Option<String>,
-    audience: Option<String>,
+    audience: Vec<String>,
         // Grace (seconds) for token clock skew (`leeway`).
     leeway: u64,
         // The algorithm allow-list; the token's `alg` must be a member.
@@ -187,7 +187,7 @@ impl AuthService {
         Arc::new(AuthService {
             enabled: false,
             issuer: None,
-            audience: None,
+            audience: Vec::new(),
             leeway: 60,
             algorithms: vec![Algorithm::HS256],
             subject_claim: "sub".to_string(),
@@ -301,9 +301,8 @@ impl AuthService {
             let iss_owned = iss.to_string();
             validation.set_issuer(&[iss_owned]);
              }
-        if let Some(aud) = &self.audience {
-            let aud_owned = aud.to_string();
-            validation.set_audience(&[aud_owned]);
+        if !self.audience.is_empty() {
+            validation.set_audience(&self.audience);
              }
 
         let data = jsonwebtoken::decode(token, &key, &validation)?;
@@ -505,7 +504,7 @@ mod tests {
         let mut cfg = AuthConfig::default();
         cfg.enabled = true;
         cfg.issuer = Some("https://janux.example/auth".to_string());
-        cfg.audience = Some("zonemail-api".to_string());
+        cfg.audience = vec!["zonemail-api".to_string()];
         cfg.clock_skew_secs = 30;
         cfg.subject_claim = "sub".to_string();
         cfg.role_claims = vec!["role".to_string(), "roles".to_string()];
@@ -536,7 +535,8 @@ mod tests {
             map.insert("iss".into(), serde_json::Value::String(iss.into()));
               }
         if let Some(aud) = aud {
-            map.insert("aud".into(), serde_json::Value::String(aud.into()));
+            map.insert("aud".into(), serde_json::Value::Array(
+                vec![serde_json::Value::String(aud.into())]));
           }
         jsonwebtoken::encode(&header, &map, &EncodingKey::from_secret(secret)).unwrap()
           }
