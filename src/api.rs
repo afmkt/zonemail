@@ -246,11 +246,71 @@ pub async fn list_domains(req: &mut Request, depot: &mut Depot, res: &mut Respon
       }
 }
 
+/// Render the 200 response for a created or idempotently-confirmed domain. A
+/// `Domain` has no mutable business fields, so any pre-existing row of the same
+/// id *is* the requested domain, and a re-create simply confirms that row.
+fn render_domain_created(res: &mut Response, domain: &Domain) {
+    res.status_code(StatusCode::OK);
+    res.render(Json(ApiResponse::ok(DomainDTO::from(domain))));
+}
+
+/// Decide the response when a mailbox create collides with an existing row.
+/// Idempotent on identical config: an incoming (normalized) mailbox matching the
+/// existing row's owning domain and `forward_to` confirms it with 200; a config
+/// difference is a genuine 409, since reconfiguring a mailbox is a patch.
+fn mailbox_resolve(res: &mut Response, existing: &Mailbox, incoming: &Mailbox) {
+    if existing.forward_to == incoming.forward_to && existing.domain_id == incoming.domain_id {
+        res.status_code(StatusCode::OK);
+        res.render(Json(ApiResponse::ok(MailboxDTO::from(existing))));
+    } else {
+        let msg = format!(
+            "mailbox '{}' already exists with a different configuration",
+            existing.id,
+        );
+        res.status_code(StatusCode::CONFLICT);
+        res.render(Json(ApiProblem::conflict(&msg)));
+    }
+}
+
+/// Decide the response when a record create collides with another row of the
+/// same owner domain. Idempotent on the full `(record_type, value, ttl)` tuple:
+/// an identical row confirms the create with 200; a row that matches type/value
+/// but has a different `ttl` is a genuine 409 (a ttl change is a patch). Returns
+/// `true` once a response was rendered, so the caller can tell a resolved match
+/// from "no matching row" - proceed to the create (pre-check) or 500 if
+/// the insert lost a race the re-scan cannot explain.
+fn record_resolve(
+    res: &mut Response,
+    rows: &[Record],
+    record_type: &RecordType,
+    value: &str,
+    ttl: u32,
+) -> bool {
+    match rows.iter().find(|r| r.record_type == *record_type && r.value.as_str() == value) {
+        Some(existing) if existing.ttl == ttl => {
+            res.status_code(StatusCode::OK);
+            res.render(Json(ApiResponse::ok(RecordApiDTO::from(existing))));
+            true
+        }
+        Some(_) => {
+            let msg = format!(
+                "a {} record for this domain with value '{}' already exists with a different ttl",
+                record_type_to_string(*record_type),
+                value,
+            );
+            res.status_code(StatusCode::CONFLICT);
+            res.render(Json(ApiProblem::conflict(&msg)));
+            true
+        }
+        None => false,
+    }
+}
+
 #[endpoint(
     summary = "Create a new domain",
     request_body = NewDomain,
     responses(
-        (status_code = 200, description = "Domain created successfully", body = ApiResponse<DomainDTO>),
+        (status_code = 200, description = "Domain created, or confirmed if it already exists (idempotent)", body = ApiResponse<DomainDTO>),
         (status_code = 400, description = "Bad request", body = ApiProblem),
         (status_code = 409, description = "Domain already exists", body = ApiProblem)
     )
@@ -266,8 +326,9 @@ pub async fn create_domain(req: &mut Request, depot: &mut Depot, res: &mut Respo
             return;
         }
     };
-    // Create the domain. A duplicate is a 409: the `Domain` model has no
-    // mutable business fields, so a create is the only meaningful transition.
+// Idempotent create: repeated creates of the same domain succeed and return the
+// existing row. A `Domain` has no mutable business fields, so there is no
+// "different" duplicate to reject — only a fresh insert or a confirmed 200.
     let domain_id = body.id.trim().to_string();
     if domain_id.is_empty() {
         res.status_code(StatusCode::BAD_REQUEST);
@@ -278,23 +339,31 @@ pub async fn create_domain(req: &mut Request, depot: &mut Depot, res: &mut Respo
       }
     let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
     let mut db = state.db.clone();
-    if Domain::get_by_id(&mut db, &domain_id).await.is_ok() {
-        res.status_code(StatusCode::CONFLICT);
-        res.render(Json(ApiProblem::conflict(&format!(
-              "domain '{domain_id}' already exists",
-         ))));
+// Idempotent: a pre-existing row of the same id *is* the requested domain;
+// the create confirms it with 200 rather than 409 so repeated creates are safe.
+    if let Ok(domain) = Domain::get_by_id(&mut db, &domain_id).await {
+        render_domain_created(res, &domain);
         return;
-      }
+        }
     match toasty::create!(Domain { id: domain_id.clone() }).exec(&mut db).await {
         Ok(domain) => {
-            res.status_code(StatusCode::OK);
-            res.render(Json(ApiResponse::ok(DomainDTO::from(&domain))));
-          }
+            render_domain_created(res, &domain);
+            }
         Err(e) => {
-            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-            res.render(Json(ApiProblem::server_error(&e.to_string())));
-          }
-      }
+                    // A concurrent create may have won the unique-constraint guard in
+                    // the window between the check above and this insert; confirm the
+                    // winner's row idempotently, or 500 if the insert genuinely failed.
+            match Domain::get_by_id(&mut db, &domain_id).await {
+                Ok(domain) => {
+                    render_domain_created(res, &domain);
+                    }
+                Err(_) => {
+                    res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                    res.render(Json(ApiProblem::server_error(&e.to_string())));
+                    }
+               }
+            }
+        }
 }
 
 #[endpoint(
@@ -385,9 +454,10 @@ pub async fn delete_domain(req: &mut Request, depot: &mut Depot, res: &mut Respo
     // Fetch first so a missing domain surfaces as a 404: a bare filtered
     // delete would silently remove zero rows and report success.
     //
-    // NOTE: this removes the `Domain` row only. Dependents (`Mailbox`,
-    // `Record`, and inbound/outbound links referencing this domain) are not
-    // cascade-deleted here; add that before exposing multi-resource teardown.
+    // NOTE: this removes the `Domain` row *and*, via toasty's engine-level
+    // cascade over its `#[has_many]` relations, its dependents too: every
+    // `Mailbox`/`Record` of the domain and, transitively, their `Inbound`/
+    // `Outbound` links (each cascading its `DeliveryStatus` rows).
     let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
     let mut db = state.db.clone();
     if Domain::get_by_id(&mut db, &domain_id).await.is_err() {
@@ -521,7 +591,7 @@ pub async fn list_mailboxes(req: &mut Request, depot: &mut Depot, res: &mut Resp
     summary = "Create a new mailbox (email address)",
     request_body = NewMailbox,
     responses(
-        (status_code = 200, description = "Mailbox created successfully", body = ApiResponse<MailboxDTO>),
+        (status_code = 200, description = "Mailbox created, or confirmed with identical config (idempotent)", body = ApiResponse<MailboxDTO>),
         (status_code = 400, description = "Bad request", body = ApiProblem),
         (status_code = 409, description = "Mailbox already exists", body = ApiProblem)
     )
@@ -575,31 +645,39 @@ pub async fn create_mailbox(req: &mut Request, depot: &mut Depot, res: &mut Resp
     mailbox.forward_to = body.forward_to;
     let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
     let mut db = state.db.clone();
-    // Fail on a duplicate address rather than silently upserting an existing mailbox.
-    if Mailbox::get_by_id(&mut db, &mailbox.id).await.is_ok() {
-        res.status_code(StatusCode::CONFLICT);
-        res.render(Json(ApiProblem::conflict(
-                &format!("mailbox '{}' already exists", mailbox.id),
-        )));
+// Idempotent on identical config: a re-create matching the existing row's owning
+// domain and `forward_to` confirms it with 200; a differing configuration is a
+// genuine 409, since reconfiguring a mailbox is a patch, not a re-create.
+    if let Ok(existing) = Mailbox::get_by_id(&mut db, &mailbox.id).await {
+        mailbox_resolve(res, &existing, &mailbox);
         return;
-    }
+        }
     match toasty::create!(Mailbox {
         id: mailbox.id.clone(),
         domain_id: mailbox.domain_id.clone(),
         forward_to: mailbox.forward_to.clone(),
-     })
-     .exec(&mut db)
-     .await
-     {
+       })
+       .exec(&mut db)
+       .await
+       {
         Ok(created) => {
             res.status_code(StatusCode::OK);
             res.render(Json(ApiResponse::ok(MailboxDTO::from(&created))));
-        }
+           }
         Err(e) => {
-            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-            res.render(Json(ApiProblem::server_error(&e.to_string())));
+                    // A concurrent create may have won the guard; confirm the winner
+                    // idempotently or 409 on a config difference, else a genuine 500.
+            match Mailbox::get_by_id(&mut db, &mailbox.id).await {
+                Ok(existing) => {
+                    mailbox_resolve(res, &existing, &mailbox);
+                    }
+                Err(_) => {
+                    res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                    res.render(Json(ApiProblem::server_error(&e.to_string())));
+                    }
+               }
+           }
         }
-    }
 }
 
 #[endpoint(
@@ -737,8 +815,9 @@ pub async fn delete_mailbox(req: &mut Request, depot: &mut Depot, res: &mut Resp
     // Fetch first so a missing mailbox surfaces as a 404 (a bare filtered delete
     // would silently remove zero rows and still report success).
     //
-    // NOTE: this removes the `Mailbox` row only. Its `Inbound`/`Outbound` link
-    // rows are not cascade-deleted here; add that before real teardown.
+    // NOTE: this removes the `Mailbox` row *and*, via toasty's engine-level
+    // cascade over its `#[has_many]` relations, its `Inbound`/`Outbound`
+    // link rows too (each cascading its `DeliveryStatus` rows).
     let state = depot.get_typed_mut::<AppState>().expect("AppState not found");
     let mut db = state.db.clone();
     if Mailbox::get_by_id(&mut db, &mailbox_id).await.is_err() {
@@ -939,7 +1018,7 @@ pub async fn list_records(req: &mut Request, depot: &mut Depot, res: &mut Respon
     summary = "Create a new DNS record",
     request_body = NewRecord,
     responses(
-         (status_code = 200, description = "DNS record created successfully", body = ApiResponse<RecordApiDTO>),
+         (status_code = 200, description = "DNS record created, or confirmed with identical tuple (idempotent)", body = ApiResponse<RecordApiDTO>),
          (status_code = 400, description = "Bad request", body = ApiProblem),
          (status_code = 409, description = "An equivalent record already exists", body = ApiProblem)
      )
@@ -989,15 +1068,13 @@ pub async fn create_record(req: &mut Request, depot: &mut Depot, res: &mut Respo
     let duplicates = toasty::query!(Record filter .domain_id == #dup_domain).exec(&mut db).await;
     match duplicates {
         Ok(rows) => {
-            if rows.iter().any(|r| r.record_type == record_type && r.value == value) {
-                res.status_code(StatusCode::CONFLICT);
-                res.render(Json(ApiProblem::conflict(&format!(
-                         "a {} record for '{domain_id}' with this value already exists",
-                    record_type_to_string(record_type),
-                 ))));
+               // Idempotent on the full (type, value, ttl) tuple; record_resolve
+               // also 409s on a ttl mismatch. Returning means it decided (a 200 or a
+               // 409), so the create must not run.
+            if record_resolve(res, &rows, &record_type, &value, body.ttl) {
                 return;
-             }
-         }
+               }
+           }
         Err(e) => {
             res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
             res.render(Json(ApiProblem::server_error(&e.to_string())));
@@ -1018,9 +1095,26 @@ pub async fn create_record(req: &mut Request, depot: &mut Depot, res: &mut Respo
             res.render(Json(ApiResponse::ok(RecordApiDTO::from(&created))));
          }
         Err(e) => {
-            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-            res.render(Json(ApiProblem::server_error(&e.to_string())));
-         }
+                    // A concurrent create may have won the triple guard in the window
+                    // between the pre-check and this insert. Re-scan the owner's
+                    // records: an identical row confirms it (200), a ttl-matching
+                    // row conflicts (409); if none matches the insert genuinely
+                    // failed (the row vanished mid-race) and it is a 500.
+            let raced = toasty::query!(Record filter .domain_id == #domain_id)
+                            .exec(&mut db).await;
+            match raced {
+                Ok(rows) => {
+                    if !record_resolve(res, &rows, &record_type, &value, body.ttl) {
+                        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                        res.render(Json(ApiProblem::server_error(&e.to_string())));
+                        }
+                   }
+                Err(_) => {
+                    res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                    res.render(Json(ApiProblem::server_error(&e.to_string())));
+                    }
+                }
+           }
      }
 }
 
@@ -2172,12 +2266,12 @@ mod tests {
         let res = TestClient::get("http://localhost/domains/gone.example").send(&service).await;
         assert_eq!(res.status_code, Some(StatusCode::NOT_FOUND));
 
-          // Duplicate create 409s.
+          // A duplicate create is idempotent: the identical create confirms the row.
         let res = TestClient::post("http://localhost/domains")
              .json(&serde_json::json!({"id": "example.com"}))
              .send(&service)
              .await;
-        assert_eq!(res.status_code, Some(StatusCode::CONFLICT));
+        assert_eq!(res.status_code, Some(StatusCode::OK));
 
           // Delete succeeds, then the domain is gone.
         let res = TestClient::delete("http://localhost/domains/example.com").send(&service).await;
@@ -2209,12 +2303,12 @@ mod tests {
         let res = TestClient::get("http://localhost/mailboxes/alice@example.com").send(&service).await;
         assert_eq!(res.status_code, Some(StatusCode::OK));
 
-          // A duplicate address 409s.
+          // A duplicate address with identical config is idempotent (200).
         let res = TestClient::post("http://localhost/mailboxes")
              .json(&serde_json::json!({"id": "alice@example.com"}))
              .send(&service)
              .await;
-        assert_eq!(res.status_code, Some(StatusCode::CONFLICT));
+        assert_eq!(res.status_code, Some(StatusCode::OK));
 
           // Patch forward_to.
         let res = TestClient::patch("http://localhost/mailboxes/alice@example.com")
@@ -2325,7 +2419,7 @@ mod tests {
                .await;
       assert_eq!(res.status_code, Some(StatusCode::BAD_REQUEST));
 
-          // A duplicate (domain, type, value) triple 409s.
+          // A duplicate triple with an identical ttl is idempotent (200).
       let res = TestClient::post("http://localhost/records")
                .json(&serde_json::json!({
                 "domain_id": "example.com",
@@ -2334,7 +2428,7 @@ mod tests {
              }))
                .send(&service)
                .await;
-      assert_eq!(res.status_code, Some(StatusCode::CONFLICT));
+      assert_eq!(res.status_code, Some(StatusCode::OK));
 
           // Patch the value; the new triple must not collide with the self row.
       let mut res = TestClient::patch(&format!("http://localhost/records/{id}", id = created.id))

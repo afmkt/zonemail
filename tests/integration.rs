@@ -52,7 +52,7 @@ async fn domain_crud_roundtrip_through_public_router() {
        .json(&serde_json::json!({"id": "example.com"}))
        .send(&service)
        .await;
-     assert_eq!(res.status_code, Some(StatusCode::CONFLICT), "duplicate domain");
+     assert_eq!(res.status_code, Some(StatusCode::OK), "idempotent re-create confirms the existing row");
 
        // Delete succeeds, then the domain is gone.
      let res =
@@ -286,4 +286,64 @@ async fn service_control_rejects_non_controllable_names() {
              "{name} is not controllable"
         );
      }
+}
+
+/// Idempotent mailbox create: re-creating the same (address, forward_to) returns 200;
+/// a differing forward_to is a reconfiguration and must conflict with 409.
+#[tokio::test]
+async fn create_mailbox_is_idempotent_and_conflicts_on_config() {
+    let service = api_service().await;
+     
+       // A re-create of the same (normalized) address with the same forward_to is
+       // idempotent: it confirms the existing row and returns 200.
+    for _ in 0..2 {
+        let res = TestClient::post("http://localhost/mailboxes")
+                .json(&serde_json::json!({"id": "alice@example.com", "forward_to": "bob@x.com"}))
+                .send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::OK), "idempotent mailbox create");
+       }
+     
+       // A re-create of the same address with a DIFFERENT forward_to is a genuine
+       // reconfiguration, not an idempotent confirm, so it must be a 409.
+    let res = TestClient::post("http://localhost/mailboxes")
+            .json(&serde_json::json!({"id": "alice@example.com", "forward_to": "c@d.com"}))
+            .send(&service).await;
+    assert_eq!(res.status_code, Some(StatusCode::CONFLICT), "differing forward_to conflicts");
+}
+
+/// Idempotent record create: re-creating the same (type, value, ttl) tuple returns 200;
+/// the same (type, value) with a different ttl is a reconfiguration (409).
+#[tokio::test]
+async fn create_record_is_idempotent_and_conflicts_on_ttl() {
+    let service = api_service().await;
+     
+       // create_record validates the referent, so provision the owner first.
+    TestClient::post("http://localhost/domains")
+            .json(&serde_json::json!({"id": "example.com"}))
+            .send(&service).await;
+     
+       // A re-create of the same (type, value, ttl) tuple is idempotent.
+    for _ in 0..2 {
+        let res = TestClient::post("http://localhost/records")
+                .json(&serde_json::json!({
+                  "domain_id": "example.com",
+                  "record_type": "A",
+                  "value": "1.2.3.4",
+                  "ttl": 90,
+               }))
+                .send(&service).await;
+        assert_eq!(res.status_code, Some(StatusCode::OK), "idempotent record create");
+       }
+     
+       // The same (type, value) with a DIFFERENT ttl is a reconfiguration; the
+       // pre-check resolves it as a 409 before the insert runs.
+    let res = TestClient::post("http://localhost/records")
+            .json(&serde_json::json!({
+              "domain_id": "example.com",
+              "record_type": "A",
+              "value": "1.2.3.4",
+              "ttl": 80,
+            }))
+            .send(&service).await;
+    assert_eq!(res.status_code, Some(StatusCode::CONFLICT), "differing ttl is a re-config");
 }
