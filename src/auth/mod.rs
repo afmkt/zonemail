@@ -202,7 +202,14 @@ impl AuthService {
 
       /// Build an enabled service from a resolved [`AuthConfig`]. Returns an
        /// [`AuthBuildError`] if the config could not yield a usable key material.
-    pub fn build(cfg: &AuthConfig) -> Result<Arc<Self>, AuthBuildError> {        let algorithms = build_algorithms(&cfg.keys)?;
+    pub fn build(cfg: &AuthConfig) -> Result<Arc<Self>, AuthBuildError> {
+             // Auth disabled ⇒ no-op guard; skip key resolution entirely so the
+             // image runs with no auth config (a default `secret` kind needs no
+             // secret unless auth is actually enabled).
+            if !cfg.enabled {
+                return Ok(Self::disabled());
+            }
+            let algorithms = build_algorithms(&cfg.keys)?;
         let key_material = build_key_material(cfg, &algorithms)?;
 
            // Spawn a background refresh for remote/issuer key sets. For an inline
@@ -571,7 +578,17 @@ mod tests {
         assert_eq!(verified.roles, vec!["admin", "ops"]);
           }
 
-       #[tokio::test]
+        #[test]
+    fn disabled_config_builds_without_secret() {
+             // Regression: the image starts with no auth config, so a default
+             // `secret` kind must not require a secret while auth is disabled.
+            let cfg = AuthConfig::default();
+            let svc = AuthService::build(&cfg)
+                         .expect("disabled auth must build without any secret");
+            assert!(!svc.is_enabled());
+     }
+
+        #[tokio::test]
      async fn wrong_alg_is_rejected() {
         let mut cfg = permissive_config();
         cfg.keys.secret = Some("secret-value!!".to_string());
