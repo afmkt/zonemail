@@ -30,7 +30,7 @@ use crate::api::api_with_doc;
 use crate::app::AppState;
 use crate::config::Config;
 use crate::dns::run_dns_server;
-use crate::email::run_mail_server;
+use crate::email::{build_smtp_config, build_smtps_config, run_mail_server};
 use salvo::oapi::ToSchema;
 use salvo::{affix_state, prelude::*};
 use serde::{Deserialize, Serialize};
@@ -55,14 +55,15 @@ pub enum Service {
     Api,
     /// The inbound SMTP (`:25` by default) listener.
     Smtp,
+    Smtps,
     /// The DNS (`:53` by default) listener.
     Dns,
 }
 
 impl Service {
     /// Every controllable service, in a stable order.
-    pub fn all() -> [Service; 3] {
-        [Service::Api, Service::Smtp, Service::Dns]
+    pub fn all() -> [Service; 4] {
+         [Service::Api, Service::Smtp, Service::Smtps, Service::Dns]
     }
 
     /// Parse a service name from the wire (path param / API body), case-insensitive.
@@ -70,6 +71,7 @@ impl Service {
         match s.trim().to_ascii_lowercase().as_str() {
             "api" => Some(Service::Api),
             "smtp" => Some(Service::Smtp),
+            "smtps" => Some(Service::Smtps),
             "dns" => Some(Service::Dns),
             _ => None,
         }
@@ -80,6 +82,7 @@ impl Service {
         match self {
             Service::Api => "api",
             Service::Smtp => "smtp",
+            Service::Smtps => "smtps",
             Service::Dns => "dns",
         }
     }
@@ -184,9 +187,11 @@ struct Inner {
     api: Slot,
     dns: Slot,
     smtp: Slot,
+    smtps: Slot,
     api_addr: SocketAddr,
     dns_addr: SocketAddr,
     smtp_addr: SocketAddr,
+    smtps_addr: Option<SocketAddr>,
 }
 
 /// A lock-guarded control plane over the controllable API / SMTP / DNS listeners.
@@ -207,15 +212,17 @@ impl Inner {
             Service::Api => &mut self.api,
             Service::Dns => &mut self.dns,
             Service::Smtp => &mut self.smtp,
+            Service::Smtps => &mut self.smtps,
         }
     }
 
     /// The bind address a service listens on, from config.
-    fn addr(&self, svc: Service) -> SocketAddr {
+    fn addr(&self, svc: Service) -> Option<SocketAddr> {
         match svc {
-            Service::Api => self.api_addr,
-            Service::Dns => self.dns_addr,
-            Service::Smtp => self.smtp_addr,
+            Service::Api => Some(self.api_addr),
+            Service::Dns => Some(self.dns_addr),
+            Service::Smtp => Some(self.smtp_addr),
+            Service::Smtps => self.smtps_addr,
         }
     }
 
@@ -224,6 +231,7 @@ impl Inner {
             Service::Api => self.api.status,
             Service::Dns => self.dns.status,
             Service::Smtp => self.smtp.status,
+            Service::Smtps => self.smtps.status,
         }
     }
 }
@@ -237,7 +245,7 @@ impl ServiceManager {
     /// Returns `Arc<Self>` so the manager can be injected into the API router by
     /// its own shared identity; the API spawn upgrades the internal `Weak` back to
     /// this same `Arc`.
-    pub fn new(cfg: &Config, app: Arc<AppState>) -> Arc<Self> {
+    pub fn new(cfg: &Config, app: Arc<AppState>, identity: Option<native_tls::Identity>) -> Arc<Self> {
         let dns_addr = cfg
             .dns_addr()
             .expect("config dns address must be valid; validated at load");
@@ -248,13 +256,16 @@ impl ServiceManager {
             .api_addr()
             .expect("config api address must be valid; validated at load");
 
+        let smtps_addr = cfg.smtp_tls.smtps_addr(&cfg.host);
         let inner = Arc::new(Mutex::new(Inner {
             api: Slot { status: Status::Idle, handle: None },
             dns: Slot { status: Status::Idle, handle: None },
             smtp: Slot { status: Status::Idle, handle: None },
+             smtps: Slot { status: Status::Idle, handle: None },
             api_addr,
             dns_addr,
             smtp_addr,
+            smtps_addr,
         }));
 
         // A `Weak` to the manager itself, filled in below once the `Arc` exists.
@@ -263,6 +274,11 @@ impl ServiceManager {
         let weak: Arc<Mutex<Weak<ServiceManager>>> = Arc::new(Mutex::new(Weak::new()));
         let weak_for_spawn = weak.clone();
         let app_for_spawn = app.clone();
+        // Shared STARTTLS/TLS material for the SMTP + SMTPS listeners: the
+        // STARTTLS policy from config and the (optional) built identity. Wrapped in
+        // `Arc` so the per-service `Fn` spawn can reuse them per call.
+        let smtp_tls = Arc::new(cfg.smtp_tls.clone());
+        let smtps_identity = Arc::new(identity);
 
         let spawn: Arc<SpawnFn> = Arc::new(move |svc, addr| match svc {
             Service::Api => {
@@ -285,15 +301,36 @@ impl ServiceManager {
                 });
                 Ok(handle)
             }
-            Service::Smtp => {
+Service::Smtp => {
                 let app = app_for_spawn.clone();
+                let tls = smtp_tls.clone();
+                let id = smtps_identity.clone();
                 let handle = tokio::spawn(async move {
-                    if let Err(e) = run_mail_server(addr, app).await {
+                     // `build_smtp_config` maps the STARTTLS policy +
+                   // identity onto `SmtpConfig.tls_mode` (Disabled /
+                    // Explicit / Required) for the plain listener.
+                    let config = build_smtp_config(addr, tls.as_ref(), id.as_ref().as_ref());
+                    if let Err(e) = run_mail_server(addr, app, config.tls_mode).await {
                         warn!("SMTP server stopped: {e}");
-                    }
-                });
+                      }
+                  });
                 Ok(handle)
-            }
+              }
+Service::Smtps => {
+                let app = app_for_spawn.clone();
+                let id = smtps_identity.clone();
+                let handle = tokio::spawn(async move {
+                    match build_smtps_config(addr, id.as_ref().as_ref()) {
+                        Some(config) => {
+                            if let Err(e) = run_mail_server(addr, app, config.tls_mode).await {
+                                 warn!("SMTPS server stopped: {e}");
+                               }
+                            },
+                         None => warn!("SMTPS requested but no TLS identity available; listener down"),
+                          }
+                   });
+                Ok(handle)
+              }
             Service::Dns => {
                 let app = app_for_spawn.clone();
                 let handle = tokio::spawn(async move {
@@ -322,9 +359,12 @@ impl ServiceManager {
                 api: Slot { status: Status::Idle, handle: None },
                 dns: Slot { status: Status::Idle, handle: None },
                 smtp: Slot { status: Status::Idle, handle: None },
+                smtps: Slot { status: Status::Idle, handle: None },
                 api_addr: "127.0.0.1:0".parse().unwrap(),
                 dns_addr: "127.0.0.1:0".parse().unwrap(),
                 smtp_addr: "127.0.0.1:0".parse().unwrap(),
+                // No SMTPS listener configured in the test harness.
+                smtps_addr: None,
             })),
             spawn,
         })
@@ -335,7 +375,8 @@ impl ServiceManager {
     /// `Err` and leaves the service idle.
     pub fn start(&self, svc: Service) -> Result<ServiceResult, String> {
         let mut guard = self.inner.lock().expect("service manager poisoned");
-        let addr = guard.addr(svc);
+        let addr = guard.addr(svc)
+                .ok_or_else(|| format!("service '{}' is not configured", svc.as_str()))?;
         let slot = guard.slot_mut(svc);
 
         if matches!(slot.status, Status::Running) {
@@ -380,31 +421,51 @@ impl ServiceManager {
 
     /// Bring up a named mode: start every service the mode wants, stop the rest.
     /// Returns the resulting list of statuses.
-    pub fn apply_mode(&self, mode: BootMode) -> Vec<ServiceReport> {
-        let wanted = mode.services();
-        for svc in Service::all() {
-            if wanted.contains(&svc) {
-                if let Err(e) = self.start(svc) {
-                    warn!("Failed to start {svc:?} for mode {mode:?}: {e}");
-                }
-            } else {
-                let _ = self.stop(svc);
-            }
-        }
-        self.list()
-    }
+ pub fn apply_mode(&self, mode: BootMode) -> Vec<ServiceReport> {
+     let wanted = mode.services();
+// A configured SMTPS listener follows plain SMTP in a mode, like any
+// other service a mode starts; an unconfigured SMTPS stays idle.
+     let smtps_wanted = self.smtps_configured() && wanted.contains(&Service::Smtp);
+     for svc in Service::all() {
+         let want = match svc {
+             Service::Smtps => smtps_wanted,
+                  _ => wanted.contains(&svc),
+             };
+         if want {
+             if let Err(e) = self.start(svc) {
+                 warn!("Failed to start {svc:?} for mode {mode:?}: {e}");
+               }
+         } else {
+             let _ = self.stop(svc);
+             }
+     }
+    self.list()
+}
 
     /// Boot the services named by a mode (used at startup). Best-effort: a service
     /// that fails to spawn is logged but does not prevent the others from starting.
-    pub fn boot(&self, mode: BootMode) {
-        for svc in mode.services() {
-            if let Err(e) = self.start(svc) {
-                warn!("Failed to boot {svc:?} from mode {mode:?}: {e}");
-            }
-        }
-    }
+ pub fn boot(&self, mode: BootMode) {
+     for svc in mode.services() {
+         if let Err(e) = self.start(svc) {
+             warn!("Failed to boot {svc:?} from mode {mode:?}: {e}");
+          }
+      }
+// When a SMTPS listener is configured, bring it up alongside the plain
+// SMTP service: "start SMTP" means "start its TLS sibling" too. Skipped
+// for modes that omit Smtp; SMTPS is not itself a mode preset.
+     if self.smtps_configured() && mode.services().contains(&Service::Smtp) {
+          let _ = self.start(Service::Smtps);
+         }
+ }
 
-    /// Stop every controllable service.
+         /// Whether a SMTPS (implicit-TLS) listener is configured, i.e.
+      /// `smtp_tls.smtps_port` is non-zero. Used to auto-follow the plain SMTP
+      /// service in `boot`/`apply_mode` without exposing the raw slot.
+    pub fn smtps_configured(&self) -> bool {
+        self.inner.lock().expect("service manager poisoned").smtps_addr.is_some()
+        }
+
+/// Stop every controllable service.
     pub fn stop_all(&self) {
         for svc in Service::all() {
             let _ = self.stop(svc);
@@ -424,6 +485,22 @@ impl ServiceManager {
 mod tests {
     use super::*;
 
+     #[tokio::test]
+    async fn smtps_starts_only_when_configured() {
+         // `for_test()` configures no SMTPS listener (`smtps_addr` is `None`), so a
+          // start must report "not configured" rather than quietly binding :465.
+        let mgr = ServiceManager::for_test();
+        let err = mgr.start(Service::Smtps);
+        assert!(err.is_err());
+        assert_eq!(mgr.status_of(Service::Smtps), Status::Idle);
+
+         // Stopping an idle SMTPS is a no-op.
+        let stopped = mgr.stop(Service::Smtps).unwrap();
+        assert!(!stopped.changed);
+        assert_eq!(mgr.status_of(Service::Smtps), Status::Idle);
+      }
+    
+
     #[test]
     fn boot_mode_services_map_correctly() {
         assert_eq!(
@@ -442,6 +519,7 @@ mod tests {
         assert_eq!(Service::parse("api"), Some(Service::Api));
         assert_eq!(Service::parse("dns"), Some(Service::Dns));
         assert_eq!(Service::parse(" SMTP "), Some(Service::Smtp));
+        assert_eq!(Service::parse("smtps"), Some(Service::Smtps));
         assert_eq!(Service::parse("bogus"), None);
     }
 
@@ -488,7 +566,7 @@ mod tests {
         assert_eq!(mgr.status_of(Service::Api), Status::Idle);
         assert_eq!(mgr.status_of(Service::Smtp), Status::Idle);
         assert_eq!(mgr.status_of(Service::Dns), Status::Running);
-        assert_eq!(reports.len(), 3);
+        assert_eq!(reports.len(), 4);
     }
 
     #[tokio::test]
@@ -496,9 +574,11 @@ mod tests {
         let mgr = ServiceManager::for_test();
         mgr.start(Service::Smtp).unwrap();
         let reports = mgr.list();
-        assert_eq!(reports.len(), 3);
+        assert_eq!(reports.len(), 4);
         assert!(reports.iter().any(|r| r.service == Service::Smtp && r.status == Status::Running));
         assert!(reports.iter().any(|r| r.service == Service::Dns && r.status == Status::Idle));
         assert!(reports.iter().any(|r| r.service == Service::Api && r.status == Status::Idle));
+        // SMTPS is a controllable peer too; unconfigured in this fake spawner -> idle.
+        assert!(reports.iter().any(|r| r.service == Service::Smtps && r.status == Status::Idle));
     }
 }

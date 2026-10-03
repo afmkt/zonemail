@@ -81,8 +81,13 @@ lettre = { version = "0.11", features = [
     "tokio1",
     "tokio1-native-tls",
 ] }
-smtpd = "0.1"
+smtpd = { version = "0.1", features = ["native-tls-backend"] }
 mail-parser = "0.11"
+# Direct dep so the inbound SMTP cert source can load a `native_tls::Identity`
+# from a cert/key without going through `smtpd`'s re-exports. Already in the
+# dependency graph via `lettre`/`salvo`, so this adds no new crate — only the
+# TLS backend on `smtpd` plus a direct reference to the `native-tls` type.
+native-tls = "0.2"
 # hickory 0.26+ is the recommended fix for RUSTSEC-2026-0119, but
 # hickory-proto 0.26.3 does not compile on rustc 1.95 (missing trait impls on
 # RecordType: Clone/Copy/Eq/Hash/Debug). Pinned to 0.24 until the upstream

@@ -64,6 +64,12 @@ pub struct Config {
     pub mode: Option<BootMode>,
     #[serde(default)]
     pub auth: AuthConfig,
+    /// TLS settings for the inbound SMTP path: STARTTLS on the plaintext `smtp` port
+    /// and an optional implicit-TLS (SMTPS) listener. Absent by default — an
+    /// empty `[smtp_tls]` (or its omission) is exactly today's clear-text `:25`
+    /// behaviour. See [`SmtpTlsConfig`].
+      #[serde(default)]
+    pub smtp_tls: SmtpTlsConfig,
 }
 
 impl Default for Config {
@@ -79,7 +85,8 @@ impl Default for Config {
             mailboxes: Vec::new(),   // Vec<MailboxEntry> is empty by default
             mode: None,            // default BootMode (full) applied via resolved_mode()
             auth: AuthConfig::default(),
-        }
+             smtp_tls: SmtpTlsConfig::default(),
+         }
     }
 }
 
@@ -374,6 +381,165 @@ impl std::str::FromStr for KeysKind {
      }
 }
 
+
+// ===========================================================================
+// Inbound SMTP transport security (STARTTLS + SMTPS)
+//
+// These augment the plain `smtp` port with an optional implicit-TLS listener and
+// the STARTTLS behaviour. Every field defaults, so an absent `[smtp_tls]` table
+// is byte-for-byte the historical clear-text `:25` behaviour.
+// ===========================================================================
+
+/// STARTTLS behaviour advertised on the plaintext SMTP listener.
+///
+/// Maps onto `smtpd`'s `TlsMode`:
+/// - `None` -> `TlsMode::Disabled` (no TLS; the historical default).
+/// - `Optional` -> `TlsMode::Explicit` (advertise STARTTLS; clear-text still permitted
+///   as an anti-relay-hardening default; RFC 3207 interoperable with every MTA).
+/// - `Required` -> `TlsMode::Required` (STARTTLS mandatory: `MAIL`/`RCPT`/`DATA` are
+///   rejected until after a TLS handshake).
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StartTlsMode {
+      /// No STARTTLS on the plaintext listener; mail is exchanged in the clear.
+      #[default]
+    None,
+      /// Advertise `STARTTLS`; the client *may* upgrade, but clear-text commands
+      /// remain permitted.
+    Optional,
+      /// Advertise `STARTTLS` and require it — no clear-text `MAIL`/`RCPT`/`DATA`.
+     Required,
+}
+
+/// Where the SMTP TLS certificate + key come from. `Files` is implemented;
+/// `Acme` is a documented, fail-fast stub for the planned DNS-01 issuance stage
+/// (which will reuse zonemail's own authoritative DNS server as the challenge
+/// provider). Selecting `Acme` today returns a hard error at load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CertSource {
+      /// Load a certificate + key from on-disk PEM files. The key must be a
+      /// PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`), e.g. the output of
+      /// `openssl genpkey` or a typical ACME/Let's Encrypt issuance.
+    Files {
+          /// Path to the leaf certificate, plus any intermediate chain certs
+          /// concatenated after it, in PEM.
+        cert_path: String,
+          /// Path to the PKCS#8 PEM private key.
+        key_path: String,
+      },
+      /// (Planned) issue and renew automatically via ACME DNS-01 through
+      /// zonemail's own DNS server. Not implemented in this stage; every field is
+      /// optional so the table can be pre-written, but selecting it fails at load.
+     Acme {
+          /// ACME CA directory URL, e.g.
+          /// `"https://acme-v02.api.letsencrypt.org/directory"`.
+          #[serde(default)]
+        acme_server: Option<String>,
+          /// Path to the ACME account key (JWK/JWS signing material).
+          #[serde(default)]
+        account_key_path: Option<String>,
+          /// Domain whose `_acme-challenge` TXT record is published for DNS-01.
+          #[serde(default)]
+        dns_domain: Option<String>,
+      },
+}
+
+/// TLS settings that augment the plain `smtp` port and optionally add an
+/// implicit-TLS (SMTPS) listener.
+///
+/// ```toml
+/// # Optional STARTTLS on :25 + an implicit-TLS (SMTPS) listener on :465.
+/// [smtp_tls]
+/// mode = "optional"
+/// smtps_port = 465
+/// cert_source = { kind = "files", cert_path = "/etc/zonemail/cert.pem", key_path = "/etc/zonemail/key.pem" }
+/// ```
+///
+/// `cert_source` is required whenever `mode` is not `none` or `smtps_port` is
+/// non-zero. When `None`, the whole SMTP path runs in the clear exactly as before.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SmtpTlsConfig {
+      /// STARTTLS behaviour on the plaintext `smtp` listener.
+     pub mode: StartTlsMode,
+       /// Implicit-TLS (SMTPS) listener port. `0` (default) disables it.
+   pub smtps_port: u16,
+        /// Where the cert + key come from. Used whenever `mode` is not `none` or
+        /// `smtps_port` is non-zero.
+       pub cert_source: Option<CertSource>,
+}
+
+impl SmtpTlsConfig {
+     /// Whether any TLS listener needs a certificate identity (i.e. STARTTLS is
+     /// advertised, or a SMTPS listener is configured).
+    pub fn needs_cert(&self) -> bool {
+        self.mode != StartTlsMode::None || self.smtps_port != 0
+      }
+
+     /// Whether the implicit-TLS (SMTPS) listener is configured to come up.
+   pub fn smtps_enabled(&self) -> bool {
+        self.smtps_port != 0
+      }
+
+       /// The SMTPS (implicit-TLS) bind address for the host in use, or `None`
+      /// when SMTPS is disabled.
+    pub fn smtps_addr(&self, host: &str) -> Option<std::net::SocketAddr> {
+        if !self.smtps_enabled() {
+            return None;
+           }
+        format!("{host}:{}", self.smtps_port).parse().ok()
+       }
+
+       /// Build the shared TLS identity from the configured [`CertSource`].
+      ///
+      /// Returns `Ok(None)` when no cert material is needed (`mode = none` and
+      /// SMTPS disabled), or the ACME stub is selected (a not-yet-implemented
+      /// error). The `Files` source reads both PEM files and builds a
+      /// `native_tls::Identity`, failing fast with a descriptive error on any
+      /// load/parse problem so a misconfiguration surfaces at boot rather than at
+      /// the first inbound handshake.
+    pub fn identity(&self) -> Result<Option<native_tls::Identity>, String> {
+        // The ACME source is a deliberate, fail-fast stub: we don't silently fall
+        // back to no-TLS when a user asked for ACME.
+        if matches!(self.cert_source.as_ref(), Some(CertSource::Acme { .. })) {
+            return Err(
+                "smtp_tls cert_source 'acme' is not yet implemented; ACME/DNS-01 issuance is a planned feature".to_string(),
+             );
+        }
+        if !self.needs_cert() {
+            return Ok(None);
+        }
+        let cert_source = self.cert_source.as_ref().ok_or_else(|| {
+            "smtp_tls requires a `cert_source` when `mode` is not `none` or `smtps_port` is non-zero".to_string()
+   })?;
+        let cert_source = match cert_source {
+            CertSource::Files { cert_path, key_path } => {
+                (cert_path.clone(), key_path.clone())
+              }
+              CertSource::Acme { .. } => {
+                  return Err(
+                      "smtp_tls cert_source 'acme' is not yet implemented".to_string()
+                      );
+              }
+          };
+        let (cert_path, key_path) = cert_source;
+        let cert = std::fs::read(&cert_path).map_err(|e| {
+             format!("failed to read smtp_tls cert '{cert_path}': {e}")
+         })?;
+        let key = std::fs::read(&key_path).map_err(|e| {
+             format!("failed to read smtp_tls key '{key_path}': {e}")
+         })?;
+        native_tls::Identity::from_pkcs8(&cert, &key).map(Some).map_err(|e| {
+             format!(
+                 "failed to build TLS identity from '{cert_path}'/'{key_path}': {e} (key must be PKCS#8 PEM)"
+             )
+        })
+      }
+}
+
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -547,4 +713,150 @@ mod tests {
         assert_eq!(a.roles["admin"].grants, Vec::from(["*".to_string()]));
         assert_eq!(a.roles["ops"].extends, Vec::from(["viewer".to_string()]));
           }
+
+     #[test]
+    fn smtp_tls_defaults_to_plain() {
+        let t = SmtpTlsConfig::default();
+        assert_eq!(t.mode, StartTlsMode::None);
+        assert_eq!(t.smtps_port, 0);
+        assert!(t.cert_source.is_none());
+        assert!(!t.needs_cert());
+        assert!(!t.smtps_enabled());
+        assert!(t.identity().is_ok());
+     }
+
+     #[test]
+    fn smtp_tls_smtps_port_computes_addr() {
+        let mut t = SmtpTlsConfig::default();
+        t.smtps_port = 465;
+        assert!(t.smtps_enabled());
+        assert!(t.needs_cert());
+        assert_eq!(t.smtps_addr("192.168.1.10").unwrap(), "192.168.1.10:465".parse().unwrap());
+        t.smtps_port = 0;
+        assert!(!t.smtps_enabled());
+        assert!(t.smtps_addr("192.168.1.10").is_none());
+     }
+
+     #[test]
+    fn smtp_tls_acme_source_fails_fast() {
+        let mut t = SmtpTlsConfig::default();
+        t.mode = StartTlsMode::Optional;
+        t.cert_source = Some(CertSource::Acme {
+                 acme_server: Some("https://acme-v02.api.letsencrypt.org/directory".into()),
+                 account_key_path: None,
+                 dns_domain: Some("mail.example.com".into()),
+              });
+        assert!(t.needs_cert());
+        assert!(t.identity().is_err());
+     }
+
+     #[test]
+    fn smtp_tls_files_missing_key_fails_fast() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!("zonemail-tls-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+
+        let mut no_source = SmtpTlsConfig::default();
+        no_source.mode = StartTlsMode::Optional;
+        assert!(no_source.identity().is_err());
+
+        std::fs::File::create(&cert).unwrap().write_all(b"---CERT---").unwrap();
+        let files = SmtpTlsConfig {
+                 mode: StartTlsMode::Required,
+                 smtps_port: 465,
+                 cert_source: Some(CertSource::Files {
+                     cert_path: cert.to_string_lossy().into(),
+                     key_path: key.to_string_lossy().into(),
+                  }),
+          };
+        assert!(files.identity().is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+     }
+
+        #[test]
+    fn smtp_tls_identity_builds_from_generated_cert() {
+          // Exercises the real `native_tls::Identity::from_pkcs8` decode path. Skip
+           // when `openssl` isn't on PATH (a hermetic environment) — the behaviour
+           // of a *missing* cert is already covered by the fails-fast tests above.
+        if std::process::Command::new("openssl").arg("--version").output().is_err() {
+             return;
+            }
+
+        let dir = std::env::temp_dir().join(format!("zonemail-tls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+
+          // A minimal self-signed cert + a PKCS#8 `-----BEGIN PRIVATE KEY-----` output,
+           // which is exactly what `from_pkcs8` expects.
+        let out = std::process::Command::new("openssl")
+                .args([
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-days",
+                    "1",
+                    "-subj",
+                    "/CN=localhost",
+                    "-keyout",
+                    key.to_string_lossy().as_ref(),
+                    "-out",
+                    cert.to_string_lossy().as_ref(),
+                ])
+                .output()
+                .expect("spawn openssl");
+        assert!(out.status.success(), "openssl generated the cert");
+
+         // Sanity: the key is PKCS#8 (not the legacy `--`/SEC1 form).
+        let key_text = std::fs::read_to_string(&key).expect("read key");
+        assert!(
+            key_text.contains("BEGIN PRIVATE KEY"),
+     "expected PKCS#8 key, got: {key_text:?}"
+        );
+
+         let tls = SmtpTlsConfig {
+              mode: StartTlsMode::Required,
+              smtps_port: 465,
+              cert_source: Some(CertSource::Files {
+                  cert_path: cert.to_string_lossy().into(),
+                  key_path: key.to_string_lossy().into(),
+              }),
+       };
+        assert!(tls.needs_cert());
+         // The real decode succeeds.
+        let id = tls.identity().expect("build identity from generated cert + key");
+        assert!(id.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+      }
+
+    #[test]
+    fn smtp_tls_parses_from_json() {
+          // Exercises the serde shape of `[smtp_tls]` (a TOML `[smtp_tls]` table maps
+          // to the same fields); `serde_json` is always available in the lib tests.
+        let json = r#"{
+               "mailbox": [{ "domain": "example.com", "kind": "internal", "email": "a@example.com" }],
+               "smtp_tls": {
+                   "mode": "required",
+                   "smtps_port": 465,
+                   "cert_source": { "kind": "files", "cert_path": "/tmp/c.pem", "key_path": "/tmp/k.pem" }
+               }
+               }"#;
+        let cfg: Config = serde_json::from_str(json).expect("parse");
+        assert_eq!(cfg.smtp_tls.mode, StartTlsMode::Required);
+        assert_eq!(cfg.smtp_tls.smtps_port, 465);
+        assert!(matches!(cfg.smtp_tls.cert_source, Some(CertSource::Files { .. })));
+          // A `cert_source` of `acme` deserializes and is flagged by `needs_cert`.
+        let json2 = r#"{"smtp_tls":{"mode":"optional","cert_source":{"kind":"acme","acme_server":"https://ca/directory","dns_domain":"m.example.com"}}}"#;
+        let cfg2: Config = serde_json::from_str(json2).expect("parse acme");
+        assert!(cfg2.smtp_tls.needs_cert());
+        assert!(matches!(cfg2.smtp_tls.cert_source, Some(CertSource::Acme { .. })));
+      }
 }

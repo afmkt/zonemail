@@ -183,14 +183,16 @@ async fn services_list_reports_all_listeners_idle_by_default() {
      let body: ApiResponse<Vec<zonemail::services::ServiceReport>> =
         res.take_json().await.expect("json body");
      assert!(body.ok, "list ok");
-     assert_eq!(body.data.len(), 3, "one report per controllable service");
+     assert_eq!(body.data.len(), 4, "one report per controllable service");
      assert!(body.data.iter().all(|r| r.status == Status::Idle), "all idle at boot");
      let has_api = body.data.iter().any(|r| r.service == Service::Api);
      let has_dns = body.data.iter().any(|r| r.service == Service::Dns);
      let has_smtp = body.data.iter().any(|r| r.service == Service::Smtp);
+     let has_smtps = body.data.iter().any(|r| r.service == Service::Smtps);
      assert!(has_api, "a report for api");
      assert!(has_dns, "a report for dns");
      assert!(has_smtp, "a report for smtp");
+     assert!(has_smtps, "a report for smtps");
 }
 
     #[tokio::test]
@@ -255,10 +257,18 @@ async fn service_mode_switches_all_listeners() {
      assert_eq!(res.status_code, Some(StatusCode::OK), "set full mode");
      let body: ApiResponse<Vec<zonemail::services::ServiceReport>> =
         res.take_json().await.expect("json body");
+         // SMTPS is config-gated (unconfigured in this fake harness) and so stays
+         // idle even in full mode; every other service is up.
+     let running = body.data
+          .iter()
+          .filter(|r| r.service != Service::Smtps)
+          .all(|r| r.status == Status::Running);
      assert!(
-        !body.data.is_empty() && body.data.iter().all(|r| r.status == Status::Running),
-        "both running after full mode"
+        !body.data.is_empty() && running,
+     "all non-SMTPS services running after full mode"
      );
+     let smtps = body.data.iter().find(|r| r.service == Service::Smtps).unwrap();
+     assert_eq!(smtps.status, Status::Idle, "smtps idle when unconfigured");
 
         // An unknown mode is a client error.
      let res =

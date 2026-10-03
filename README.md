@@ -61,8 +61,11 @@ RFC-7807-style error document, and list endpoints are paginated (`limit`/`offset
   stored twice.
 - **Automatic forwarding**: mail delivered to a forwarded mailbox is re-enqueued
   for delivery to its `forward_to` address.
-- **No SMTP authentication / no TLS on inbound** — public MX senders connect on
-  plaintext; gate the port at the network layer.
+- **No SMTP authentication on inbound** — public MX senders connect unauthenticated;
+  gate the port at the network layer. **Transport security is opt-in**: by default
+  the `smtp` listener is plaintext, but a `[smtp_tls]` config table enables
+  STARTTLS on the standard port and a separate SMTPS (implicit-TLS, usually 465)
+  listener as a first-class, controllable service.
 
 ### Outbound SMTP & mail forwarding
 
@@ -125,7 +128,8 @@ Set expectations so you can decide whether it covers your use case:
 
 - **No** accounts, authentication, or passwords.
 - **No** POP3/IMAP and **no** webmail UI — access mail through the API.
-- **No** TLS on the inbound SMTP or DNS listeners.
+- Inbound transport is **plaintext by default**; STARTTLS / SMTPS are opt-in via
+  a `[smtp_tls]` table (see `zonemail.example.toml`). No TLS on the DNS listener.
 - **No API for creating DNS records** — they are seeded via config (or added by
   other means); the API manages domains and mailboxes, not records.
 - **No catch-all / wildcard mailboxes** — forwarding is configured per address.

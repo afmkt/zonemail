@@ -1965,7 +1965,7 @@ async fn start_service(req: &mut Request, depot: &mut Depot, res: &mut Response)
          None => {
              res.status_code(StatusCode::BAD_REQUEST);
              res.render(Json(ApiProblem::bad_request(
-                  &format!("unknown service '{service_name}'; expected 'dns' or 'smtp'"),
+                  &format!("unknown service '{service_name}'; expected one of 'api', 'smtp', 'smtps', 'dns'"),
               )));
              return;
             }
@@ -2001,7 +2001,7 @@ async fn stop_service(req: &mut Request, depot: &mut Depot, res: &mut Response) 
          None => {
              res.status_code(StatusCode::BAD_REQUEST);
              res.render(Json(ApiProblem::bad_request(
-                  &format!("unknown service '{service_name}'; expected 'dns' or 'smtp'"),
+                  &format!("unknown service '{service_name}'; expected one of 'api', 'smtp', 'smtps', 'dns'"),
               )));
              return;
             }
@@ -2627,13 +2627,14 @@ mod tests {
         assert_eq!(res.status_code, Some(StatusCode::OK));
         let body: ApiResponse<Vec<ServiceReport>> = res.take_json().await.expect("json body");
         assert!(body.ok);
-        assert_eq!(body.data.len(), 3);
+        assert_eq!(body.data.len(), 4);
         for r in &body.data {
             assert_eq!(r.status, Status::Idle);
             assert!(
                 r.service == Service::Api
                      || r.service == Service::Dns
                      || r.service == Service::Smtp
+                       || r.service == Service::Smtps
                  );
               }
             }
@@ -2655,7 +2656,7 @@ mod tests {
         assert!(!r.data.changed);
 
               // The outbound delivery worker is *not* a controllable service, so a start
-            // for it has no route and 400s (`api`/`smtp`/`dns` are the three services).
+            // for it has no route and 400s (`api`/`smtp`/`dns` are 'api'/'smtp'/'dns' plus the config-gated 'smtps').
         let res = TestClient::post("http://localhost/services/outbound/start").send(&service).await;
         assert_eq!(res.status_code, Some(StatusCode::BAD_REQUEST));
 
@@ -2697,8 +2698,10 @@ mod tests {
                             .await;
         assert_eq!(res.status_code, Some(StatusCode::OK));
         let body: ApiResponse<Vec<ServiceReport>> = res.take_json().await.expect("json body");
-        assert_eq!(body.data.len(), 3);
-        assert!(body.data.iter().all(|r| r.status == Status::Running));
+        assert_eq!(body.data.len(), 4);
+        let running: Vec<_> = body.data.iter().filter(|r| r.service != Service::Smtps).collect();
+        assert!(running.iter().all(|r| r.status == Status::Running));
+        assert_eq!(body.data.iter().find(|r| r.service == Service::Smtps).unwrap().status, Status::Idle);
 
               // An unknown mode 400s.
         let res =

@@ -1,11 +1,15 @@
 use crate::app::AppState;
+use crate::config::SmtpTlsConfig;
 use crate::db::{Inbound, Mailbox, Message};
 use crate::send::enqueue_forward;
 use mail_parser::{Address, MessageParser};
-use smtpd::{async_trait, start_server, Error as SmtpError, Response, Session, SmtpConfig};
+use smtpd::{
+           async_trait, start_server, Error as SmtpError, Response, Session, SmtpConfig, TlsConfig, TlsMode
+        };
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{info, warn};
+
 
 // Best-effort first e-mail address from a parsed `From:`/`To:`/etc. header value
 // (`mail_parser::Address` has no `Display` impl). Used for single-recipient fields.
@@ -234,21 +238,102 @@ impl smtpd::SmtpHandlerFactory for ZonedHandlerFactory {
 }
 
 // 3. Entry point to spawn the server in your main application
+
+/// Build the `smtpd` [`TlsMode`] for a STARTTLS policy on the plaintext `smtp`
+/// listener.
+///
+/// [`StartTlsMode::None`] maps to `TlsMode::Disabled` (no TLS, the historical
+/// default). `Optional`/`Required` wrap the identity in `Explicit`/`Required`. A
+/// missing identity there degrades to `Disabled` with a warning — a fallback guard
+/// only, since callers build the identity up front via `SmtpTlsConfig::identity`.
+fn build_starttls_mode(
+      mode: crate::config::StartTlsMode,
+     identity: Option<&native_tls::Identity>,
+) -> TlsMode {
+    use crate::config::StartTlsMode as S;
+    match mode {
+        S::None => TlsMode::Disabled,
+         S::Optional => match identity {
+            Some(id) => TlsMode::Explicit(TlsConfig::NativeTls(id.clone())),
+             None => {
+                warn!("smtp_tls STARTTLS requested but no TLS identity available; falling back to plaintext");
+                TlsMode::Disabled
+               }
+             },
+        S::Required => match identity {
+            Some(id) => TlsMode::Required(TlsConfig::NativeTls(id.clone())),
+             None => {
+                warn!("smtp_tls STARTTLS required but no TLS identity available; falling back to plaintext");
+                TlsMode::Disabled
+               }
+             },
+         }
+      }
+
+/// The full [`SmtpConfig`] a plain/STARTTLS `smtp` listener binds with, given its
+/// bind address, the STARTTLS policy of the shared [`SmtpTlsConfig`], and the
+/// shared identity.
+pub fn build_smtp_config(
+     bind_addr: SocketAddr,
+      tls: &SmtpTlsConfig,
+     identity: Option<&native_tls::Identity>,
+) -> SmtpConfig {
+    let tls_mode = build_starttls_mode(tls.mode, identity);
+    SmtpConfig {
+        bind_addr: bind_addr.to_string(),
+         require_auth: false, // Inbound mail from public MX servers won't have your API auth
+          tls_mode,
+             ..Default::default()
+        }
+      }
+
+/// Build the implicit-TLS (`TlsMode::Implicit`) config for a SMTPS listener: the
+/// handshake happens on connect. Returns `None` when no identity is available, in
+/// which case the caller leaves the listener down.
+pub fn build_smtps_config(
+     bind_addr: SocketAddr,
+     identity: Option<&native_tls::Identity>,
+) -> Option<SmtpConfig> {
+    let id = identity?;
+    Some(SmtpConfig {
+        bind_addr: bind_addr.to_string(),
+         require_auth: false,
+          tls_mode: TlsMode::Implicit(TlsConfig::NativeTls(id.clone())),
+             ..Default::default()
+         })
+ }
+
+/// Entry point to spawn the server. `tls_mode` drives STARTTLS
+/// (`Explicit`/`Required`) on the plain port or implicit TLS (`Implicit`, for
+/// SMTPS) on connect; `Disabled` is the historical plain TCP listener. The
+/// store/forward handler is transport-agnostic — the same `handle_rcpt`/
+/// `handle_email` serve clear, STARTTLS, and SMTPS sessions alike.
 pub async fn run_mail_server(
-    bind_addr: SocketAddr,
-    state: Arc<AppState>,
+     bind_addr: SocketAddr,
+     state: Arc<AppState>,
+    tls_mode: TlsMode,
 ) -> Result<(), std::io::Error> {
     let config = SmtpConfig {
         bind_addr: bind_addr.to_string(),
-        require_auth: false, // Inbound mail from public MX servers won't have your API auth
-          ..Default::default()
-      };
+         require_auth: false, // Inbound mail from public MX servers won't have your API auth
+          tls_mode,
+             ..Default::default()
+        };
 
     let factory = ZonedHandlerFactory { state };
 
-    info!("Starting smtpd inbound mail server on {}", config.bind_addr);
-    start_server(config, factory).await
+      // Describe the active transport security so an operator can confirm the
+       // mode without reading config.
+   match &config.tls_mode {
+      TlsMode::Disabled => info!("Starting smtpd inbound mail server on {} (plaintext)", config.bind_addr),
+      TlsMode::Explicit(_) => info!("Starting smtpd inbound mail server on {} (STARTTLS, optional)", config.bind_addr),
+       TlsMode::Required(_) => info!("Starting smtpd inbound mail server on {} (STARTTLS, required)", config.bind_addr),
+        TlsMode::Implicit(_) => info!("Starting smtpd inbound SMTPS server on {} (implicit TLS)", config.bind_addr),
+        }
+
+   start_server(config, factory).await
 }
+
 
 // ===========================================================================
 // Tests

@@ -5664,8 +5664,10 @@ dependencies = [
  "base64 0.22.1",
  "hostname",
  "lazy_static",
+ "native-tls",
  "regex",
  "tokio",
+ "tokio-native-tls",
  "trust-dns-resolver",
 ]
 
@@ -7832,6 +7834,7 @@ dependencies = [
  "jsonwebtoken",
  "lettre",
  "mail-parser",
+ "native-tls",
  "reqwest",
  "rust-embed",
  "salvo",

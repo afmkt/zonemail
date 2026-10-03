@@ -48,7 +48,13 @@ impl Daemon {
      /// to bring listeners up.
     pub async fn build(cfg: Config) -> Result<Self, Box<dyn std::error::Error>> {
         let app = Arc::new(AppState::init(&cfg).await?);
-        let services = ServiceManager::new(&cfg, app.clone());
+         // Load the optional SMTP TLS identity up front so a misconfiguration
+        // (a missing or undecodable cert file, or the not-yet-implemented ACME
+           // source) surfaces here at boot rather than at the first handshake.
+    let identity = cfg.smtp_tls
+                 .identity()
+                .map_err(|e| format!("failed to build SMTP TLS identity: {e}"))?;
+         let services = ServiceManager::new(&cfg, app.clone(), identity);
         Ok(Self { cfg, app, services })
      }
 

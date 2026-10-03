@@ -130,3 +130,48 @@ mailboxes = []
 #   # [auth.roles.ops]
 #   #   extends = [ "viewer" ]
 #   #   grants = [ "mailboxes:*", "*:read" ]
+
+# ===========================================================================
+# Inbound SMTP transport security (STARTTLS + SMTPS).
+#
+# Omitting this table (or leaving `mode = "none"`) leaves the `smtp` listener
+# fully plaintext - the historical behaviour, with zero cost. When TLS is
+# enabled, Zonemail builds a single `native_tls::Identity` and shares it across
+# two listeners:
+#
+#   * the `smtp` port gets STARTTLS (RFC 3207) - STARTTLS advertised on port 25,
+#     negotiated mid-session. `mode = "optional"` advertises it (STARTTLS-capable
+#     but not required); `mode = "required"` makes STARTTLS mandatory before a
+#     session may MAIL FROM (the TLS-only "530 Must issue a STARTTLS command
+#     first" semantics of the underlying server). Note: the `smtpd` 0.1.x
+#     inline-TLS upgrade has known rough edges - `optional` is the tested path;
+#     `required` is wired but less battle-tested.
+#
+#   * `smtps` is a *separate* first-class listener on its own port (the
+#     conventional 465 / implicit-TLS port), reachable at `/services` alongside
+#     `api` / `smtp` / `dns`. It is config-gated: when `smtps_port` is 0 / unset
+#     the Smtps service is dormant. It auto-follows the `smtp` service at boot
+#     when configured (no separate mode entry).
+#
+# Where the cert+key come from:
+#   * `kind = "files"` - load the PEM files named by `cert_path` / `key_path` at
+#     boot. The key must be a PKCS#8 private key (the `native_tls` backend only
+#     accepts PKCS#8; a `BEGIN RSA PRIVATE KEY` / SEC1 key is rejected up front).
+#   * `kind = "acme"` - a fail-fast *stub* for future automated certificates via
+#     the `acme` crate + a DNS-01 challenge served through this very server's
+#     authoritative DNS (the whole point of Zonemail). Selecting it today
+#     surfaces a clear "not implemented" error at boot so a deploy fails closed
+#     rather than silently falling back to plaintext.
+#
+# [smtp_tls]
+#   mode = "optional"         # "none" | "optional" | "required"
+#   smtps_port = 465          # 0 = no separate SMTPS/implicit-TLS listener
+#   cert_source = { kind = "files", cert_path = "cert.pem", key_path = "key.pem" }
+#
+#   # Acme (not implemented - boots a clear error until ACME is wired):
+#   #   cert_source = {
+#   #      kind = "acme",
+#   #      acme_server = "https://acme-staging-v2.letsencrypt.org/directory",
+#   #      account_key_path = "acme-account.key",   # EC/P-256 ACME account key
+#   #      dns_domain = "example.com",             # authoritative domain to issue for
+#   #   }

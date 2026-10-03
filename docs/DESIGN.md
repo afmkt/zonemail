@@ -83,6 +83,11 @@ Zonemail is a lightweight, custom-built email service and provisioning microserv
    * An external mail server connects to the Samotop SMTP listener.
    * Samotop validates the recipient against the database records.
    * If valid, the email is accepted, parsed via `mail-parser`, and stored.
+    * **Transport security is opt-in.** By default the inbound `smtp` listener is
+      plaintext. A `[smtp_tls]` table builds one TLS identity (`kind = "files"`; an `acme`
+      source is a fail-fast stub) applied to two listeners: STARTTLS on the standard
+      port and a separate first-class SMTPS (implicit-TLS) listener, controllable via
+      `/services` and auto-following `smtp` at boot.
 3. **Outbound Mail Flow**:
    * Business logic enqueues a send via `enqueue_outbound`, which stores the
         message and a `Queued` job and returns - no network I/O on the request
