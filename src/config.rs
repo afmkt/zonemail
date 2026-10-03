@@ -70,6 +70,12 @@ pub struct Config {
     /// behaviour. See [`SmtpTlsConfig`].
       #[serde(default)]
     pub smtp_tls: SmtpTlsConfig,
+     /// Outbound delivery posture: TLS posture + an optional fixed submission
+     /// relay + credentials. Absent by default — omitting `[outbound]` is
+     /// exactly today's clear-text, unauthenticated MX-to-MX handoff on
+     /// `submission_port` (`:25`). See [`OutboundTransport`].
+     #[serde(default)]
+    pub outbound: OutboundTransport,
 }
 
 impl Default for Config {
@@ -86,6 +92,7 @@ impl Default for Config {
             mode: None,            // default BootMode (full) applied via resolved_mode()
             auth: AuthConfig::default(),
              smtp_tls: SmtpTlsConfig::default(),
+             outbound: OutboundTransport::default(),
          }
     }
 }
@@ -541,6 +548,126 @@ impl SmtpTlsConfig {
 
 
 // ===========================================================================
+// Outbound delivery
+//
+// The outbound counter-part of inbound's `[smtp_tls]`: `[outbound]` controls how
+// zonemail *sends* — the TLS posture of the SMTP connection and an optional
+// fixed submission relay (the production norm) instead of per-recipient MX.
+// ===========================================================================
+
+/// TLS/security posture for the **outbound** SMTP connection.
+///
+/// Maps onto `lettre`'s `Tls` selection: `Plain` is `Tls::None` (the current,
+/// clear-text, zero-cost default), `Opportunistic`/`Required` are STARTTLS
+/// (`Tls::Opportunistic`/`Tls::Required`), and `Implicit` is SMTPS
+/// (`Tls::Wrapper`, conventionally port `465`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboundTlsMode {
+       /// Plaintext connection only. `Tls::None` — the default and the historical
+       /// behaviour.
+       #[default]
+    Plain,
+       /// Advertise and use `STARTTLS` when the peer supports it, otherwise fall
+       /// back to plaintext. `Tls::Opportunistic`; exposed because the design
+       /// asks for STARTTLS support, but MITM-risky — for testing/dev only.
+    Opportunistic,
+       /// Require a `STARTTLS` upgrade before any mail is transmitted; the attempt
+       /// fails when the peer cannot TLS. `Tls::Required`; MITM-safe.
+    Required,
+       /// Implicit TLS from connect — SMTPS, conventionally port `465`.
+       /// `Tls::Wrapper`.
+    Implicit,
+}
+
+/// A fixed upstream submission relay. When set, outbound is handed to this one
+/// host instead of doing a per-recipient MX lookup — the classic `submission`
+/// (`:587`, STARTTLS + AUTH) or `smtps` (`:465`, implicit TLS) on a provider.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutboundRelay {
+       /// Relay hostname, e.g. `"smtp.example.com"`.
+    pub host: Option<String>,
+       /// Port dialed on the relay. `0` ⇒ use the worker's `submission_port`.
+#[serde(default)]
+    pub port: u16,
+       /// AUTH username. When present, SMTP `AUTH` is used (PLAIN).
+      #[serde(default)]
+    pub user: Option<String>,
+       /// Inline AUTH password. Prefer
+       /// [`password_env`](Self::password_env) to keep it out of the config file.
+      #[serde(default)]
+    pub password: Option<String>,
+       /// Name of the process environment variable holding the AUTH password.
+      #[serde(default)]
+    pub password_env: Option<String>,
+}
+
+impl OutboundRelay {
+       /// Whether this relay is actually usable (a host was given).
+    pub fn is_configured(&self) -> bool {
+        self.host.is_some()
+       }
+
+       /// Resolved AUTH credentials: the `user` paired with the password from
+       /// `password_env` (preferred) or `password`, or `None` when AUTH is not
+       /// configured. The env var is read at delivery time so a rotated secret
+       /// doesn't require a restart.
+    pub fn credentials(&self) -> Option<(String, String)> {
+        let user = self.user.clone()?;
+        let pass = if let Some(env) = &self.password_env {
+            std::env::var(env).ok()?
+       } else {
+        self.password.clone()?
+       };
+      Some((user, pass))
+     }
+}
+
+/// Outbound transport + security configuration — the outbound counter-part of
+/// inbound's [`SmtpTlsConfig`].
+///
+/// ```toml
+/// [outbound]
+/// tls = "required"     # STARTTLS mandatory before any mail is sent
+/// insecure = false     # accept untrusted peer certs — dev/localhost only
+/// relay = { host = "smtp.example.com", port = 587, user = "postmaster",
+///            password_env = "ZONEMAIL_SMTP_PASS" }
+/// ```
+///
+/// Omitting `[outbound]` (or leaving `tls = "plain"` with no `relay`) yields
+/// exactly today's behaviour: a clear-text, unauthenticated MX-to-MX handoff on
+/// `submission_port` (`:25` by default).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutboundTransport {
+       /// TLS posture of the outbound connection. `plain` keeps it clear-text.
+       #[serde(default)]
+    pub tls: OutboundTlsMode,
+       /// Route everything through one fixed upstream relay instead of
+       /// per-recipient MX lookup. `None` (default) ⇒ MX-to-MX, the historical
+       /// path.
+      #[serde(default)]
+    pub relay: Option<OutboundRelay>,
+       /// Accept peer certificates that fail verification (trust and/or
+       /// hostname). **Dev/localhost only** — never `true` in production.
+      #[serde(default)]
+    pub insecure: bool,
+}
+
+impl OutboundTransport {
+       /// Whether any TLS is requested on the outbound connection at all.
+    pub fn tls_enabled(&self) -> bool {
+        self.tls != OutboundTlsMode::Plain
+       }
+
+       /// Whether a fixed submission relay is actually configured (a host given).
+    pub fn relay_configured(&self) -> bool {
+      self.relay.as_ref().is_some_and(OutboundRelay::is_configured)
+       }
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 //
@@ -859,4 +986,120 @@ mod tests {
         assert!(cfg2.smtp_tls.needs_cert());
         assert!(matches!(cfg2.smtp_tls.cert_source, Some(CertSource::Acme { .. })));
       }
+
+       #[test]
+ fn outbound_transport_defaults_to_plain_no_relay() {
+          // No `[outbound]` table -> exactly today's clear-text MX-to-MX behaviour.
+        let json = r#"{}"#;
+        let cfg = serde_json::from_str::<Config>(json).unwrap();
+        assert!(!cfg.outbound.tls_enabled());
+        assert!(!cfg.outbound.relay_configured());
+        assert_eq!(cfg.outbound.tls, OutboundTlsMode::Plain);
+        assert!(cfg.outbound.relay.is_none());
+        }
+
+       #[test]
+ fn outbound_transport_parses_tls_and_relay() {
+        let json = r#"{
+          "outbound": {
+            "tls": "required",
+            "insecure": true,
+            "relay": { "host": "smtp.example.com", "port": 587,
+              "user": "postmaster", "password_env": "ZONEMAIL_OUT_PASS" }
+          } }"#;
+        let cfg = serde_json::from_str::<Config>(json).unwrap();
+        assert_eq!(cfg.outbound.tls, OutboundTlsMode::Required);
+        assert!(cfg.outbound.tls_enabled());
+        assert!(cfg.outbound.relay_configured());
+        let relay = cfg.outbound.relay.unwrap();
+        assert_eq!(relay.host.as_deref(), Some("smtp.example.com"));
+        assert_eq!(relay.port, 587);
+        assert_eq!(relay.user.as_deref(), Some("postmaster"));
+        assert_eq!(relay.password_env.as_deref(), Some("ZONEMAIL_OUT_PASS"));
+        }
+
+         #[test]
+          fn outbound_relay_without_port_defaults_to_submission_port() {
+                // With `#[serde(default)]` on `port`, a relay table that omits it
+                // parses to 0, which the worker interprets as "use the configured
+                // submission_port" (no extra knob for the common case).
+               let json = r#"{
+                  "outbound": {
+                    "tls": "implicit",
+                    "relay": { "host": "smtp.provider.net", "user": "me" }
+                 } }"#;
+               let cfg = serde_json::from_str::<Config>(json).unwrap();
+               // Check the gate on the owned struct before unwrapping (unwrap moves).
+               assert!(cfg.outbound.relay_configured());
+               let relay = cfg.outbound.relay.unwrap();
+               assert_eq!(relay.host.as_deref(), Some("smtp.provider.net"));
+               assert_eq!(relay.port, 0, "absent port defaults to 0 => submission_port");
+          }
+
+        #[test]
+         fn outbound_with_only_relay_defaults_to_plain_tls() {
+                // `tls` now defaults, so a relay table without `tls` parses to
+                // `Plain` (clear text to the relay). Only `relay` is required.
+                let json = r#"{
+                   "outbound": {
+                     "relay": { "host": "smtp.example.com" }
+                  } }"#;
+                let cfg = serde_json::from_str::<Config>(json).unwrap();
+                assert_eq!(cfg.outbound.tls, OutboundTlsMode::Plain);
+                assert!(!cfg.outbound.tls_enabled());
+                assert!(cfg.outbound.relay_configured());
+            }
+
+       #[test]
+ fn outbound_transport_parses_all_modes() {
+        for (val, want) in [("plain", OutboundTlsMode::Plain),
+          ("opportunistic", OutboundTlsMode::Opportunistic),
+          ("required", OutboundTlsMode::Required),
+          ("implicit", OutboundTlsMode::Implicit)] {
+          let json = format!(r#"{{ "outbound": {{ "tls": "{val}" }} }}"#);
+          let c = serde_json::from_str::<Config>(&json).expect("parse");
+          assert_eq!(c.outbound.tls, want, "mode {val}");
+          assert_eq!(c.outbound.tls_enabled(), want != OutboundTlsMode::Plain);
+          }
+        }
+
+       #[test]
+ fn outbound_relay_credentials_env_then_none() {
+          // No user -> no credentials, and the relay isn't usable.
+        let none = OutboundRelay { user: None, ..Default::default() };
+        assert!(none.credentials().is_none());
+        assert!(!none.is_configured());
+
+          // password_env is read at call time.
+        unsafe { std::env::set_var("ZONE_OUT_PASS_TEST", "s3cret"); }
+        let via_env = OutboundRelay {
+        host: Some("r".into()),
+        user: Some("u".into()),
+        password_env: Some("ZONE_OUT_PASS_TEST".into()),
+          ..Default::default()
+           };
+        assert_eq!(via_env.credentials(), Some(("u".to_string(), "s3cret".to_string())));
+        assert!(via_env.is_configured());
+        unsafe { std::env::remove_var("ZONE_OUT_PASS_TEST"); }
+
+          // A missing env var yields no credentials (rather than erroring).
+        let missing = OutboundRelay {
+        user: Some("u".into()),
+        password_env: Some("ZONE_OUT_DOES_NOT_EXIST".into()),
+          ..Default::default()
+           };
+        assert!(missing.credentials().is_none());
+        }
+
+       #[test]
+ fn outbound_relay_credentials_inline_password() {
+        let relay = OutboundRelay {
+        host: Some("smtp.example.com".into()),
+        user: Some("u".into()),
+        password: Some("p".into()),
+          ..Default::default()
+          };
+        assert_eq!(relay.credentials(), Some(("u".to_string(), "p".to_string())));
+        assert!(relay.is_configured());
+        }
 }

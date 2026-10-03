@@ -16,6 +16,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
        // 3. Build the control plane: database init + seed, and the service manager.
        //    No listener binds yet.
     let boot_mode = cfg.resolved_mode();
+      // 5' Capture the outbound transport posture (TLS + optional relay) before
+      //`cfg` is moved into `Daemon::build`, so the delivery worker reflects it.
+    let outbound_transport = cfg.outbound.clone();
     let daemon = Daemon::build(cfg).await?;
     info!("Database initialized and seeded successfully.");
 
@@ -33,7 +36,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
        //    `JoinHandle` that the select awaits.
     let db = daemon.app().db.clone();
     let outbound = tokio::spawn(async move {
-        run_outbound_worker(db, OutboundWorkerConfig::default()).await;
+        run_outbound_worker(db, OutboundWorkerConfig {
+            transport: outbound_transport,
+            ..Default::default()
+               }).await;
       });
     let outbound_abort = outbound.abort_handle();
 

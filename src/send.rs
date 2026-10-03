@@ -11,6 +11,7 @@
 //! failures re-queue the job with an exponential backoff until it succeeds or
 //! exhausts its attempt cap.
 
+use crate::config::{OutboundTlsMode, OutboundTransport};
 use crate::db::{DeliveryStatus, Message, Outbound, OutboundStatus};
 // `TransactionMode` is not re-exported by `toasty`, so name it from the core.
 use toasty_core::driver::operation::TransactionMode;
@@ -19,7 +20,11 @@ use hickory_resolver::TokioAsyncResolver;
 use jiff::Timestamp;
 use lettre::{
     address::{Address as LettreAddress, Envelope},
-    transport::smtp::AsyncSmtpTransport,
+    transport::smtp::{
+        authentication::Credentials,
+        client::{Tls, TlsParameters},
+        AsyncSmtpTransport,
+     },
     AsyncTransport, Message as LettreMessage, Tokio1Executor,
 };
 use mail_parser::{Address as ParsedAddress, MessageParser};
@@ -89,6 +94,10 @@ pub struct OutboundWorkerConfig {
     /// Upper bound on the retry backoff.
     pub max_backoff: std::time::Duration,
            /// Port dialed on a recipient MX host (default 25; override for a relay/sink).
+      /// Outbound transport + security posture: TLS posture, an optional fixed
+      /// submission relay, and credentials. The default is clear-text,
+      /// unauthenticated MX-to-MX on `:25` — the historical behaviour.
+      pub transport: OutboundTransport,
       pub submission_port: u16,
 }
 
@@ -111,7 +120,8 @@ impl Default for OutboundWorkerConfig {
             max_attempts: 8,
             base_backoff: std::time::Duration::from_secs(60),
             max_backoff: std::time::Duration::from_secs(3_600),
-                submission_port: SUBMISSION_PORT,
+                transport: OutboundTransport::default(),
+            submission_port: SUBMISSION_PORT,
         }
     }
 }
@@ -420,6 +430,38 @@ async fn deliver_one(
     deliver_hosts(db, outbound, &message, &envelope, config, now, &hosts).await
 }
 
+/// Map the configured [`OutboundTransport`] to `lettre`'s `Tls` selection for a
+/// peer `domain`, honouring `insecure` (a dev/localhost self-signed relay).
+///
+/// `Plain` yields `Tls::None` and never touches the TLS stack, so the default
+/// path (no TLS) stays zero-cost. Credentials are applied separately by the
+/// caller when a relay user is set.
+fn build_outbound_tls(
+    transport: &OutboundTransport,
+    domain: &str,
+) -> Result<Tls, Box<dyn std::error::Error + Send + Sync>> {
+    if !transport.tls_enabled() {
+        return Ok(Tls::None);
+     }
+     // `dangerous_accept_invalid_{certs,hostnames}` is the seam for a dev/localhost
+      // relay that presents a self-signed CA or a localhost name. Off by default;
+      // turning it on is a conscious, local-only choice.
+    let mut params = TlsParameters::builder(domain.to_string());
+    if transport.insecure {
+        params = params
+               .dangerous_accept_invalid_hostnames(true)
+               .dangerous_accept_invalid_certs(true);
+        }
+    let params = params.build_native()?;
+    Ok(match transport.tls {
+        OutboundTlsMode::Opportunistic => Tls::Opportunistic(params),
+        OutboundTlsMode::Required => Tls::Required(params),
+        OutboundTlsMode::Implicit => Tls::Wrapper(params),
+        // `Plain` is unreachable: the `tls_enabled()` guard above handles it.
+        OutboundTlsMode::Plain => Tls::None,
+      })
+    }
+
 /// Transport-level core of [`deliver_one`]: attempt delivery of one `Outbound`
 /// job to an explicit list of SMTP hosts (highest priority first). Each attempt
 /// appends a `DeliveryStatus` row; the first `250` resolves the job to
@@ -443,19 +485,49 @@ pub async fn deliver_hosts(
     now: Timestamp,
     hosts: &[String],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if hosts.is_empty() {
+        // Choose the target host(s): a fixed submission relay when one is
+     // configured, else the recipient's per-recipient MX hosts in priority
+      // order. A relay is the production norm (one upstream, usually
+      // authenticated on :587); MX-to-MX is the zero-config default.
+    let targets: Vec<String> = if config.transport.relay_configured() {
+        let host = config
+               .transport
+               .relay
+               .as_ref()
+               .and_then(|r| r.host.clone())
+               .ok_or("outbound relay is configured but has no `host`")?;
+        info!("Outbound {} using fixed submission relay {host}", outbound.id);
+        vec![host]
+      } else {
+    hosts.to_vec()
+      };
+
+    if targets.is_empty() {
         warn!("No MX records for recipient of Outbound {}; requeueing for retry", outbound.id);
         return fail_or_requeue(db, &mut outbound, config, now, "no MX records for domain").await;
-        }
+      }
 
-        // Try each MX in priority order, recording one DeliveryStatus per attempt.
+        // Try each target in priority order, recording one DeliveryStatus per
+        // attempt. With a relay the target list is the single relay host.
     let mut last_error: Option<String> = None;
-    for host in hosts {
-        info!("Outbound {} attempting MX {host}", outbound.id);
-        let transport =
+    for host in &targets {
+       let port = config.transport.relay.as_ref().map_or(config.submission_port(),
+            |r| if r.port == 0 { config.submission_port() } else { r.port });
+        info!("Outbound {} attempting {host} on port {port}", outbound.id);
+         // Build the per-target transport: the TLS posture mapped from
+     // `transport.tls` (Plain => no TLS, the default and zero-cost), the
+     // configured port, and AUTH credentials when a relay user is set.
+        let tls = build_outbound_tls(&config.transport, host)?;
+        let mut builder =
             AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host.clone())
-                     .port(config.submission_port())
-                     .build();
+                       .port(port)
+                       .tls(tls);
+        if let Some((user, pass)) =
+            config.transport.relay.as_ref().and_then(|r| r.credentials())
+        {
+        builder = builder.credentials(Credentials::new(user, pass));
+      }
+        let transport = builder.build();
 
         match transport.send_raw(&envelope, &message.raw).await {
             Ok(response) => {
@@ -646,14 +718,14 @@ async fn lookup_mx_hosts(
 mod tests {
     use super::*;
     use std::time::Duration;
-    use tokio::io::{split, AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{split, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
 
         // Write one CRLF-terminated reply through the connection's write half.
         // `split()` gives independent read/write halves, so the sink can interleave
         // reads and writes on one socket with no shared-mutable-borrow problem.
-    async fn write_resp(
-         w: &mut tokio::io::WriteHalf<tokio::net::TcpStream>,
+    async fn write_resp<W: AsyncWrite + Unpin>(
+         w: &mut W,
         bytes: &[u8],
      ) {
         let _ = w.write_all(bytes).await;
@@ -722,6 +794,109 @@ mod tests {
                 }
             }
         }
+    // An implicit-TLS (SMTPS) sink: accept a TCP connection, complete a TLS
+    // handshake with an acceptor built from a self-signed `native_tls::Identity`,
+    // then drive the same cleartext-style SMTP handshake so an implicit-TLS
+    // outbound delivery records a 250 with no external server. Used to exercise
+    // `deliver_hosts` over `OutboundTlsMode::Implicit`. Returns `None` when
+    // `openssl` is unavailable, so the caller can skip in a hermetic env.
+    async fn smtps_sink_port() -> Option<u16> {
+        let id = generate_self_signed_identity()?;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let acceptor: ::tokio_native_tls::TlsAcceptor =
+            ::native_tls::TlsAcceptor::new(id).ok()?.into();
+        tokio::spawn(async move {
+            loop {
+                let stream = match listener.accept().await {
+                    Ok((s, _)) => s,
+                    Err(_) => continue,
+                      };
+                     // A failed handshake (a client that disconnected) just ends this
+                     // connection; the next accept starts fresh.
+                let tls = match acceptor.accept(stream).await {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                      };
+                      // One connection at a time suffices for the single-job test.
+                handle_smtps_session(tls).await;
+                   }
+               });
+        Some(port)
+           }
+
+          // Drive one accepted *implicit-TLS* connection through a `QUIT`-free SMTP
+          // handshake - identical responses to `handle_sink_session`, over a TLS
+          // stream produced by `tokio_native_tls::TlsStream`.
+    async fn handle_smtps_session(tls: ::tokio_native_tls::TlsStream<tokio::net::TcpStream>) {
+        let (rd, mut wr) = split(tls);
+        let mut reader = BufReader::new(rd);
+        let mut buf: Vec<u8> = Vec::new();
+        write_resp(&mut wr, b"220 sink ESMTP\r\n").await;
+        loop {
+            let n = reader.read_until(b'\n', &mut buf).await;
+            match n {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+                  }
+            let cmd = String::from_utf8_lossy(&buf).trim_end().to_ascii_uppercase();
+            if cmd.starts_with("EHLO") || cmd.starts_with("HELO") {
+                write_resp(&mut wr, b"250 sink\r\n").await;
+                  } else if cmd.starts_with("MAIL") {
+                write_resp(&mut wr, b"250 OK\r\n").await;
+                  } else if cmd.starts_with("RCPT") {
+                write_resp(&mut wr, b"250 OK\r\n").await;
+                  } else if cmd == "DATA" {
+                     write_resp(&mut wr, b"354 Go ahead\r\n").await;
+                loop {
+                    let n = reader.read_until(b'\n', &mut buf).await;
+                    if n.unwrap_or(0) == 0 {
+                        break;
+                          }
+                    if String::from_utf8_lossy(&buf).trim_end() == "." {
+                        break;
+                          }
+                      }
+                write_resp(&mut wr, b"250 2.0.0 OK queued\r\n").await;
+                  } else if cmd.starts_with("QUIT") {
+                write_resp(&mut wr, b"221 bye\r\n").await;
+                break;
+                  } else {
+                write_resp(&mut wr, b"250 OK\r\n").await;
+                  }
+              }
+          }
+
+     // Generate a short-lived self-signed cert + a PKCS#8 key with the `openssl`
+     // CLI (the same tool the inbound TLS smoke test uses) and turn them into a
+     // `native_tls::Identity`. Returns `None` when `openssl` is unavailable.
+    fn generate_self_signed_identity() -> Option<::native_tls::Identity> {
+        if ::std::process::Command::new("openssl").arg("--version").output().is_err() {
+            return None;
+          }
+        let dir = ::std::env::temp_dir()
+                  .join(format!("zonemail-out-smtps-{}", ::std::process::id()));
+        let _ = ::std::fs::remove_dir_all(&dir);
+         ::std::fs::create_dir_all(&dir).ok()?;
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        let out = ::std::process::Command::new("openssl")
+                  .args([
+                      "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                      "-subj", "/CN=127.0.0.1",
+                      "-keyout", key.to_string_lossy().as_ref(),
+                      "-out", cert.to_string_lossy().as_ref(),
+                  ])
+                  .output()
+                  .ok()?;
+        assert!(out.status.success(), "openssl generated the cert");
+        let cert_bytes = ::std::fs::read(&cert).ok()?;
+        let key_bytes = ::std::fs::read(&key).ok()?;
+        let _ = ::std::fs::remove_dir_all(&dir);
+         ::native_tls::Identity::from_pkcs8(&cert_bytes, &key_bytes).ok()
+        }
+
 
         // Open a port, drop the listener, and return the now-free port so a client
         // connection is refused — this drives the retry path without DNS.
@@ -878,7 +1053,61 @@ mod tests {
           assert_eq!(statuses[0].code, Some(250), "recorded a 250 success code");
         }
 
-        #[tokio::test]
+         #[tokio::test]
+     async fn deliver_hosts_smtps_implicit_tls_delivers() {
+      // End-to-end implicit-TLS (SMTPS) delivery: a job is delivered through
+      // `OutboundTlsMode::Implicit` to the self-signed in-process acceptor,
+      // proving the TLS path records a 250. Skips when `openssl` is
+      // unavailable (a hermetic env), where the cleartext path always covers
+      // delivery via `deliver_hosts_delivers_to_local_sink`.
+        let port = match smtps_sink_port().await {
+            Some(p) => p,
+            None => {
+                eprintln!("[skip] openssl unavailable; skipping SMTPS e2e");
+                return;
+           }
+         };
+        let (mut db, mid, oid) =
+            fresh_message_and_job("alice@example.com", "bob@example.com").await;
+        let outbound = load_outbound(&mut db, oid).await;
+        let stored = Message::get_by_id(&mut db, &mid).await.expect("stored message present");
+        let envelope =
+            build_envelope(&stored.mail_from, &outbound.rcpt_to).expect("build envelope");
+        // Relay to the implicit-TLS sink on a self-signed cert; `insecure`
+        // accepts the untrusted localhost certificate, as a real relay would be
+        // trusted via `danger_accept_invalid_certs`.
+        let cfg = OutboundWorkerConfig {
+            transport: OutboundTransport {
+                tls: OutboundTlsMode::Implicit,
+                relay: Some(crate::config::OutboundRelay {
+                    host: Some("127.0.0.1".to_string()),
+                    port: port,
+                    user: None,
+                    password: None,
+                    password_env: None,
+               }),
+                   insecure: true,
+         ..Default::default()
+             },
+         ..Default::default()
+             };
+        deliver_hosts(
+                     &mut db,
+                 outbound,
+                     &stored,
+                     &envelope,
+                     &cfg,
+                 jiff::Timestamp::now(),
+                     &["127.0.0.1".to_string()],
+           )
+           .await
+           .expect("deliver over implicit TLS");
+        let job = load_outbound(&mut db, oid).await;
+        assert_eq!(job.status, OutboundStatus::Delivered, "job Delivered via SMTPS sink");
+        assert_eq!(job.attempts, 1, "one successful implicit-TLS attempt");
+         }
+
+   #[tokio::test]
      async fn deliver_hosts_requeues_when_port_refused() {
           let (mut db, mid, oid) =
               fresh_message_and_job("alice@example.com", "bob@no.example").await;
@@ -906,5 +1135,31 @@ mod tests {
           assert_eq!(job.attempts, 1, "one attempted delivery before re-queue");
           assert!(job.next_attempt_at.is_some(), "backoff scheduled for the retry");
           assert!(job.last_error.is_some(), "failure reason recorded");
+        }
+          #[test]
+    fn build_outbound_tls_plain_is_none() {
+           // The default posture is clear-text and never touches the TLS stack.
+        let t = OutboundTransport::default();
+        assert!(!t.tls_enabled());
+        assert!(!t.relay_configured());
+        let tls = build_outbound_tls(&t, "mx.example.com").expect("plain builds");
+        assert!(matches!(tls, Tls::None));
+        }
+
+          #[test]
+    fn build_outbound_tls_maps_enabled_modes() {
+           // Opportunistic / Required / Implicit all yield a real `Tls` selection
+      // (a native connector is built), distinct from the `Plain` =`None` case.
+      // `insecure` lets the native connector build for a localhost/self-signed name.
+        for mode in [OutboundTlsMode::Opportunistic, OutboundTlsMode::Required,
+        OutboundTlsMode::Implicit] {
+        let t = OutboundTransport {
+             tls: mode,
+             insecure: true,
+               ..Default::default()
+               };
+        let tls = build_outbound_tls(&t, "smtp.example.com").expect("tls builds");
+        assert!(!matches!(tls, Tls::None), "mode {mode:?} produced a TLS selection");
+          }
         }
 }

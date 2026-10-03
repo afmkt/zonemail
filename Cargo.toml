@@ -135,3 +135,9 @@ zonemail = { path = ".", features = ["test-support"] }
 # normal dependency, so it does not leak into a consumer of the published
 # `zonemail` library's build graph.
 toasty-cli = "0.10"
+
+# Drives the *outbound* SMTPS (implicit-TLS) end-to-end test: this is the
+# server-side acceptor counterpart to `lettre`'s `Tls::Wrapper` client
+# already used for delivery. It is only needed by the `outbound_smtps_*`
+# self-test, so it lives here rather than in `[dependencies]`.
+tokio-native-tls = "0.3"

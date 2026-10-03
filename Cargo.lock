@@ -7847,6 +7847,7 @@ dependencies = [
  "toasty-core",
  "toasty-driver-turso",
  "tokio",
+ "tokio-native-tls",
  "tracing",
  "tracing-subscriber",
  "turso",

@@ -80,6 +80,12 @@ RFC-7807-style error document, and list endpoints are paginated (`limit`/`offset
   two workers on one database never double-send the same message.
 - Outbound can be redirected to a local sink/relay (e.g. Mailpit) by
   overriding the submission port for testing.
+- **Opt-in transport security** via an `[outbound]` table: `tls =` `plain` |
+  `opportunistic` | `required` | `implicit` selects clear text, STARTTLS, or
+  SMTPS (implicit TLS on :465); an optional `relay` routes every send through a
+  single authenticated upstream instead of per-recipient MX. Omitting `[outbound]`
+  is exactly the historical clear-text, unauthenticated MX-to-MX handoff — see
+  `zonemail.example.toml`.
 
 ### DNS
 
@@ -129,7 +135,9 @@ Set expectations so you can decide whether it covers your use case:
 - **No** accounts, authentication, or passwords.
 - **No** POP3/IMAP and **no** webmail UI — access mail through the API.
 - Inbound transport is **plaintext by default**; STARTTLS / SMTPS are opt-in via
-  a `[smtp_tls]` table (see `zonemail.example.toml`). No TLS on the DNS listener.
+  a `[smtp_tls]` table, and **outbound** transport security is opt-in via a
+  parallel `[outbound]` table (STARTTLS / SMTPS + an optional authenticated
+  relay). No TLS on the DNS listener.
 - **No API for creating DNS records** — they are seeded via config (or added by
   other means); the API manages domains and mailboxes, not records.
 - **No catch-all / wildcard mailboxes** — forwarding is configured per address.

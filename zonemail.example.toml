@@ -175,3 +175,51 @@ mailboxes = []
 #   #      account_key_path = "acme-account.key",   # EC/P-256 ACME account key
 #   #      dns_domain = "example.com",             # authoritative domain to issue for
 #   #   }
+
+# ===========================================================================
+# Outbound delivery transport security (STARTTLS / SMTPS + optional relay).
+#
+# This is the *outbound* counter-part of `[smtp_tls]` (which governs *inbound*
+# delivery to this server). Omitting `[outbound]` leaves delivery exactly as
+# before: a clear-text, unauthenticated MX-to-MX handoff on port 25 - zero cost.
+#
+#    * `tls` selects the security of the *outbound* SMTP connection:
+#        - `plain`         (default) - clear text on `submission_port` (25).
+#        - `opportunistic`           - STARTTLS if the peer advertises it, else
+#                                       fall back to clear text (MITM-risky;
+#                                       dev/test only).
+#        - `required`                - STARTTLS is mandatory; a non-TLS peer
+#                                       fails the send (MITM-safe).
+#        - `implicit`                - implicit TLS from connect (SMTPS; the
+#                                       conventional 465). Set
+#                                       `submission_port = 465`.
+#    * `insecure` (false by default) accepts certificates that fail verification
+#      - a dev/localhost self-signed relay. NEVER enable in production.
+#    * `relay` fixes a single upstream instead of a per-recipient MX lookup -
+#      the production norm (one authenticated provider). When set, every send
+#      goes to `relay.host:relay.port` (`relay.port = 0`/omitted =>
+#      `submission_port`):
+#        - `user` / `password` (or `password_env`, preferred) add `AUTH PLAIN`.
+#        - The peer certificate is verified against the system trust store for
+#          `relay.host` (hostname + trust), unless `insecure` is set.
+#
+# [outbound]
+#   tls = "required"            # "plain" | "opportunistic" | "required" |
+#                               # "implicit"
+#   insecure = false
+#   submission_port = 587       # 0/omitted => 25 (MX-to-MX); 587 => STARTTLS
+#                               # 465 => SMTPS / implicit TLS
+#   relay = { host = "smtp.example.com", user = "postmaster",
+#             password_env = "ZONEMAIL_SMTP_PASS" }    # AUTH via env (preferred)
+#
+#    # MX-to-MX with STARTTLS on the recipient's own MX (no relay):
+#    # [outbound]
+#    #   tls = "required"
+#    #   submission_port = 25
+#
+#    # Send everything through a fixed SMTPS / implicit-TLS relay on 465:
+#    # [outbound]
+#    #   tls = "implicit"
+#    #   submission_port = 465
+#    #   relay = { host = "smtp.provider.net", user = "me@example.com",
+#    #             password_env = "ZONEMAIL_SMTP_PASS" }
